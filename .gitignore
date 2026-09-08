@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# The local LLM weights are fetched by scripts/download_model.py (a
+# one-time setup step), never committed to version control -- see
+# README.md ("Local AI model").
+models/

@@ -1,0 +1,9 @@
+pandas
+numpy
+openpyxl
+rapidfuzz
+streamlit
+pytest
+scikit-learn
+llama-cpp-python
+huggingface-hub

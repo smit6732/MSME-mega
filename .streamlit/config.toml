@@ -1,0 +1,23 @@
+[theme]
+# The STATIC base theme -- matches app.py's _LIGHT_TOKENS exactly, since
+# this is what Streamlit's own native widgets (buttons, sliders, the
+# file uploader chrome, focus rings) use, and it's also the light-first
+# default this tool's own design brief calls for. The runtime dark-mode
+# toggle in app.py works on top of this via CSS injection (checked:
+# Streamlit 1.61 has no public runtime "set theme" API), not by editing
+# this file -- see app.py's module docstring for why.
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F3F4F6"
+textColor = "#111827"
+font = "sans serif"
+
+[client]
+# Hides Streamlit's default "Deploy" button and "⋮" menu -- without
+# this, the app reads as an unfinished dev tool rather than a product.
+# "minimal" keeps only what's essential (e.g. the running-status
+# indicator), not "none", which would also hide useful state.
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false
