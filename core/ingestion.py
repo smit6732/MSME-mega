@@ -531,6 +531,17 @@ DATE_FORMAT_PATTERNS = [
 ]
 _COMBINED_DATE_PATTERN = "|".join(DATE_FORMAT_PATTERNS)
 
+# A bare time-of-day (no date component at all, e.g. "23:49:28") and a
+# bare short digit string (e.g. a zero-padded ID like "0001") both used
+# to slip through _looks_like_date's pandas fallback below as false
+# positives -- see that function's docstring for why, and why it matters.
+_BARE_TIME_PATTERN = re.compile(r"^\d{1,2}:\d{2}(:\d{2})?$")
+# A compact date with no separator (e.g. "20200115" for 2020-01-15) is
+# always exactly 8 digits -- shorter all-digit strings (a 4-digit ID, a
+# 6-digit pincode) are never a compact date, so this length is what lets
+# the shape guard tell them apart.
+_COMPACT_DATE_DIGIT_COUNT = 8
+
 # Characters a human commonly adds to a "number" that stop it from parsing
 # as one: currency symbols, thousands separators, surrounding whitespace.
 _NUMERIC_FORMATTING_CHARACTERS = re.compile(r"[₹$,\s]")
@@ -581,10 +592,28 @@ def _looks_like_date(sample: pd.Series) -> bool:
     # (e.g. names, GST numbers) as part of ruling date out, so pandas'
     # "could not infer format" warning is expected noise here, not a
     # real problem -- we suppress it rather than let it spam the console.
+    #
+    # The fallback is deliberately lenient about FORMAT (that's the whole
+    # point of having it) but it must not be lenient about SHAPE -- a
+    # value with no date-like separator, no month name, and no compact
+    # 8-digit length isn't a date no matter how pandas parses it. Found
+    # on real (non-MSME) sensor-log data: a bare zero-padded ID like
+    # "0001" (pandas silently reads it as the year 2001) and a bare time
+    # like "23:49:28" (pandas silently attaches TODAY's date -- which
+    # would make the inferred type depend on which calendar day the tool
+    # happens to run, breaking this project's "same file twice -> same
+    # result" guarantee). Both are filtered out here before pandas ever
+    # gets a chance to "successfully" parse them into something they aren't.
+    looks_date_shaped = (
+        sample.str.contains(r"[-/.]", regex=True)
+        | sample.str.contains(r"[A-Za-z]{3}", regex=True)
+        | sample.str.match(rf"^\d{{{_COMPACT_DATE_DIGIT_COUNT}}}$")
+    ) & ~sample.str.match(_BARE_TIME_PATTERN)
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
         parsed = pd.to_datetime(sample, errors="coerce", dayfirst=True)
-    return parsed.notna().mean() >= TYPE_MATCH_THRESHOLD
+    return (parsed.notna() & looks_date_shaped).mean() >= TYPE_MATCH_THRESHOLD
 
 
 def _looks_numeric(sample: pd.Series) -> bool:

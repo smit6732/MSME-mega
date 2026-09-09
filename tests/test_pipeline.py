@@ -593,6 +593,56 @@ def test_clean_utf8_csv_gets_no_encoding_warning():
     assert dataset_profile.encoding_warning is None
 
 
+# ---- Regression: date-type inference false positives on non-date data -----
+# Found via a real user-supplied sensor/IoT alerts log (not MSME business
+# data): a bare zero-padded ID column ("0001" repeated) and a bare
+# time-of-day column ("23:49:28", no date component) were both
+# misclassified as COLUMN_TYPE_DATE, because core.ingestion._looks_like_date's
+# pandas fallback silently accepts a 4-digit string as "the year" and a
+# bare time as "today's date + that time". This cascaded into a bogus
+# 100%-fuzzy-duplicate-rows finding (the identity-column picker fell back
+# to a column that was wrongly excluded from being a real text column)
+# and a meaningfully deflated overall score (62.0 vs the correct 87.0).
+
+def test_zero_padded_id_column_is_not_misclassified_as_a_date():
+    import io
+
+    buffer = io.BytesIO(b"node_id,label\n0001,a\n0001,b\n0001,c\n0001,d\n0001,e\n")
+    buffer.name = "ids.csv"
+    profile = load_dataset(buffer, "ids.csv")
+    assert profile.column_types["node_id"] == "numeric"
+
+
+def test_bare_time_of_day_column_is_not_misclassified_as_a_date():
+    """A bare time-of-day is not a date -- and treating it as one would
+    make the inferred type depend on the wall-clock date the tool
+    happens to run on, breaking the "same file twice -> same result"
+    guarantee (pandas silently attaches TODAY's date to a bare time)."""
+    import io
+
+    buffer = io.BytesIO(
+        b"timestamp,label\n23:49:28,a\n23:49:25,b\n23:49:22,c\n23:49:19,d\n23:49:01,e\n"
+    )
+    buffer.name = "times.csv"
+    profile = load_dataset(buffer, "times.csv")
+    assert profile.column_types["timestamp"] == "text"
+
+
+def test_real_dates_still_classified_correctly_after_the_shape_guard():
+    """The shape guard added for the two regressions above must not
+    reject genuine dates that only match via the pandas fallback (not
+    one of the explicit DATE_FORMAT_PATTERNS) -- e.g. a dot-separated
+    or compact 8-digit date."""
+    import io
+
+    buffer = io.BytesIO(
+        b"reg_date,label\n2020.01.15,a\n2019.03.22,b\n2021.06.30,c\n2018.11.05,d\n2022.02.28,e\n"
+    )
+    buffer.name = "dotted_dates.csv"
+    profile = load_dataset(buffer, "dotted_dates.csv")
+    assert profile.column_types["reg_date"] == "date"
+
+
 # ---- Priority 3: degenerate file edge cases --------------------------------
 
 def test_completely_empty_file_raises_a_clean_error():
@@ -675,6 +725,9 @@ if __name__ == "__main__":
         test_preamble_row_is_detected_and_skipped_on_excel,
         test_non_utf8_csv_is_read_via_fallback_with_a_visible_warning,
         test_clean_utf8_csv_gets_no_encoding_warning,
+        test_zero_padded_id_column_is_not_misclassified_as_a_date,
+        test_bare_time_of_day_column_is_not_misclassified_as_a_date,
+        test_real_dates_still_classified_correctly_after_the_shape_guard,
         test_completely_empty_file_raises_a_clean_error,
         test_header_only_file_raises_a_clean_error,
         test_single_column_file_runs_the_full_pipeline_without_crashing,
