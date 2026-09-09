@@ -24,12 +24,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core.ingestion import load_dataset, load_all_tables
 from core.pipeline import run_pipeline_for_table, run_multi_table_pipeline
 from core.calibration import calibrate_duplicate_threshold, calibrate_severity_thresholds
+from core.findings import Finding
+from core.remediation import remediate_table
+from core.chart_generation import generate_charts_for_table
 import core.llm_phrasing as llm_phrasing
 
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SINGLE_TABLE_CSV = os.path.join(REPO_ROOT, "sample_data", "messy_msme_sample.csv")
 MULTI_SHEET_XLSX = os.path.join(REPO_ROOT, "sample_data", "multi_sheet_msme_workbook.xlsx")
+TEST_DATASET_CSV = os.path.join(REPO_ROOT, "test_dataset.csv")
 
 
 # ---- Single-table backward compatibility ----------------------------------
@@ -693,6 +697,298 @@ def test_single_column_file_runs_the_full_pipeline_without_crashing():
     assert len(duplication_findings) >= 1
 
 
+# ---- Tier 1: core/remediation.py -------------------------------------------
+
+def _finding(issue_type: str, column_name: str = "Some_Column", percentage_affected: float = 50.0,
+             example=None, rule_based_description: str = "A generic problem sentence.") -> Finding:
+    """Builds a bare Finding directly -- these Tier 1 tests exercise
+    core/remediation.py's own dispatch/guard logic in isolation, the
+    same way core/llm_phrasing.py's tests build a Finding by hand
+    (see test_ai_phrasing_falls_back_cleanly_when_model_unavailable)
+    rather than running the whole pipeline just to get one."""
+    return Finding(
+        table_name="t", column_name=column_name, check_type="x", issue_type=issue_type,
+        percentage_affected=percentage_affected, severity="moderate",
+        rule_based_description=rule_based_description, example=example,
+    )
+
+
+def test_remediation_numeric_fix_strips_valid_grouping_but_leaves_ambiguous_values():
+    """The spec's own headline example ("25,00,000" -> "2500000") must
+    work, alongside Western grouping, while a grouping that doesn't fit
+    either convention (e.g. "1,2,345") is left untouched, not guessed at."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "Annual_Revenue": ["25,00,000", "2,500,000", "1,2,345", "980000"],
+    })
+    finding = _finding("inconsistent_format_numeric", column_name="Annual_Revenue")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert len(result.actions) == 1
+    action = result.actions[0]
+    assert action.action_type == "strip_numeric_formatting"
+    assert action.count_affected == 2  # only the two valid-grouping values changed
+    assert action.notes is not None and "1" in action.notes  # one ambiguous value flagged
+
+    cleaned_values = result.cleaned_dataframe["Annual_Revenue"].tolist()
+    assert "2500000" in cleaned_values
+    assert "2500000" in cleaned_values  # both "25,00,000" and "2,500,000" clean to this
+    assert "1,2,345" in cleaned_values  # left exactly as-is -- never guessed
+    assert "980000" in cleaned_values   # already clean, unaffected
+    assert not result.manual_review
+
+
+def test_remediation_declines_a_fully_ambiguous_numeric_column():
+    """When NOTHING in the column can be safely cleaned, the whole
+    Finding must go to manual review rather than silently doing nothing."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Annual_Revenue": ["1,2,345", "9,87,6"]})
+    finding = _finding("inconsistent_format_numeric", column_name="Annual_Revenue")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert result.actions == []
+    assert len(result.manual_review) == 1
+    assert result.manual_review[0].finding is finding
+    assert result.manual_review[0].reason  # non-empty, plain-language
+
+
+def test_remediation_date_fix_normalizes_unambiguous_dates_but_leaves_ambiguous_ones():
+    """03-04-2020 is the spec's own textbook ambiguous case (day/month
+    could plausibly be either way round) -- it must be left untouched,
+    while a date with a component > 12 is unambiguous and gets normalized."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Registration_Date": ["15-03-2019", "03-04-2020"]})
+    finding = _finding("inconsistent_format_date", column_name="Registration_Date")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert len(result.actions) == 1
+    action = result.actions[0]
+    assert action.action_type == "normalize_date_format"
+    assert action.count_affected == 1
+    assert action.after_example == "2019-03-15"
+    assert action.notes is not None and "1" in action.notes
+
+    cleaned_values = result.cleaned_dataframe["Registration_Date"].tolist()
+    assert "2019-03-15" in cleaned_values
+    assert "03-04-2020" in cleaned_values  # ambiguous -- untouched
+
+
+def test_remediation_leading_year_dates_with_small_day_and_month_are_not_flagged_ambiguous():
+    """Regression test for a real bug found via live browser verification:
+    a LEADING 4-digit year (already YYYY-MM-DD, e.g. "2021-01-10") must
+    NOT be treated as ambiguous just because both remaining components
+    happen to be <= 12 -- the year's position already tells us the
+    month/day order, unlike a TRAILING year (e.g. "03-04-2020", which
+    genuinely is ambiguous). Getting this wrong flooded the audit log
+    with dozens of already-correct dates falsely reported as "ambiguous"."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Registration_Date": ["2021-01-10", "2020-07-22", "15-01-2020"]})
+    finding = _finding("inconsistent_format_date", column_name="Registration_Date")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    # Only the trailing-year value (unambiguous: 15 > 12) should have
+    # changed -- the two already-ISO values must be left exactly as-is
+    # AND must not be counted as ambiguous.
+    assert len(result.actions) == 1
+    action = result.actions[0]
+    assert action.count_affected == 1
+    assert action.after_example == "2020-01-15"
+    assert action.notes is None  # nothing here was genuinely ambiguous
+
+    cleaned_values = result.cleaned_dataframe["Registration_Date"].tolist()
+    assert "2021-01-10" in cleaned_values
+    assert "2020-07-22" in cleaned_values
+
+
+def test_remediation_trims_whitespace_only_never_touches_casing():
+    """Whitespace gets trimmed; a pure casing difference (deliberately
+    out of scope -- there's no objectively "correct" case) is left alone."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"City": [" Ahmedabad", "ahmedabad", "Surat"]})
+    finding = _finding("inconsistent_format_text", column_name="City")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert len(result.actions) == 1
+    action = result.actions[0]
+    assert action.action_type == "trim_whitespace"
+    assert action.count_affected == 1  # only the whitespace value changed
+
+    cleaned_values = result.cleaned_dataframe["City"].tolist()
+    assert "Ahmedabad" in cleaned_values  # trimmed
+    assert "ahmedabad" in cleaned_values  # casing left exactly as-is
+
+
+def test_remediation_declines_text_fix_when_only_casing_differs():
+    """If a text Finding's inconsistency is entirely casing (no
+    whitespace to trim), applying "the fix" would be a no-op -- this
+    must be reported honestly as a decline, not a fix that did nothing."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"City": ["Ahmedabad", "ahmedabad"]})
+    finding = _finding("inconsistent_format_text", column_name="City")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert result.actions == []
+    assert len(result.manual_review) == 1
+    assert result.manual_review[0].finding is finding
+
+
+def test_remediation_removes_exact_duplicate_rows_reusing_given_indexes():
+    """Must reuse the row indexes handed in (as duplication.py's own
+    exact_duplicate_row_indexes would be) rather than recomputing them."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "Business_Name": ["Krishna Enterprises", "Om Sai Distributors", "Krishna Enterprises"],
+    })
+    finding = _finding("exact_duplicate_rows", column_name="(whole row)")
+
+    result = remediate_table(dataframe, [finding], exact_duplicate_row_indexes=[2])
+
+    assert len(result.actions) == 1
+    assert result.actions[0].action_type == "remove_exact_duplicate_rows"
+    assert result.actions[0].count_affected == 1
+    assert len(result.cleaned_dataframe) == 2
+    assert "Krishna Enterprises" in result.cleaned_dataframe["Business_Name"].tolist()
+
+
+def test_remediation_never_silently_drops_missing_data_fuzzy_or_structural_findings():
+    """These three issue_types have NO safe automatic fix -- every one of
+    them must land on the manual review list, never vanish."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Contact_Number": ["123", None]})
+    findings = [
+        _finding("missing_data", column_name="Contact_Number", percentage_affected=37.5),
+        _finding("fuzzy_duplicate_rows", column_name="Business_Name", example="Shree Balaji Traders vs Shri Balaji Traders"),
+        _finding("structural_issue", column_name="GST_Number", rule_based_description="Duplicate GST_Number found."),
+    ]
+
+    result = remediate_table(dataframe, findings, [])
+
+    assert result.actions == []
+    assert len(result.manual_review) == 3
+    reviewed_findings = [item.finding for item in result.manual_review]
+    assert reviewed_findings == findings  # same three, same order, none dropped
+    assert all(item.reason for item in result.manual_review)  # every reason is non-empty
+
+
+def test_remediation_never_mutates_the_caller_dataframe_or_touches_the_score():
+    """The diagnostic score must stay identical whether or not Tier 1
+    ever runs -- proven here by showing remediate_table works on a COPY,
+    never the caller's own dataframe (the one the score was computed from)."""
+    dataset_profile = load_dataset(TEST_DATASET_CSV, "test_dataset.csv")
+    result = run_pipeline_for_table(dataset_profile, "test_dataset.csv", use_ai_phrasing=False)
+    original_snapshot = result.dataframe.copy(deep=True)
+    score_before = result.scorecard.overall_score
+
+    remediate_table(result.dataframe, result.findings, result.duplication_result.exact_duplicate_row_indexes)
+
+    assert result.dataframe.equals(original_snapshot)
+    assert result.scorecard.overall_score == score_before
+
+
+def test_remediation_matches_known_test_dataset_issues():
+    """Runs Tier 1 against test_dataset.csv and checks it against this
+    file's actual, hand-verified content: an exact duplicate row
+    ("Krishna Enterprises", rows 8/9), Annual_Revenue's 5 comma-formatted
+    values, and Contact_Number's missing data (37.5%, 15 of 40 rows)."""
+    dataset_profile = load_dataset(TEST_DATASET_CSV, "test_dataset.csv")
+    result = run_pipeline_for_table(dataset_profile, "test_dataset.csv", use_ai_phrasing=False)
+
+    remediation = remediate_table(
+        result.dataframe, result.findings, result.duplication_result.exact_duplicate_row_indexes,
+    )
+
+    # The exact duplicate row must actually be gone.
+    assert len(remediation.cleaned_dataframe) == len(result.dataframe) - 1
+    exact_dup_actions = [a for a in remediation.actions if a.action_type == "remove_exact_duplicate_rows"]
+    assert len(exact_dup_actions) == 1
+    assert exact_dup_actions[0].count_affected == 1
+
+    # Annual_Revenue's comma-formatted values (5 of them) must be cleaned.
+    revenue_actions = [a for a in remediation.actions if a.column_name == "Annual_Revenue"]
+    assert len(revenue_actions) == 1
+    assert revenue_actions[0].count_affected == 5
+    assert "," not in revenue_actions[0].after_example
+
+    # Contact_Number's missing data must be left on manual review, never auto-filled.
+    contact_manual_review = [
+        item for item in remediation.manual_review
+        if item.finding.column_name == "Contact_Number" and item.finding.issue_type == "missing_data"
+    ]
+    assert len(contact_manual_review) == 1
+    assert "37.5" in contact_manual_review[0].reason
+
+    # Registration_Date: exactly 2 unambiguous DD-MM-YYYY values get
+    # normalized ("15-03-2019", "20-12-2015" -- day > 12 rules out the
+    # month reading); "05-11-2018" is genuinely ambiguous and must be
+    # left alone. The other 37 rows are already YYYY-MM-DD and must NOT
+    # be falsely flagged ambiguous just because month/day are both <= 12
+    # (see test_remediation_leading_year_dates_with_small_day_and_month_are_not_flagged_ambiguous).
+    date_actions = [a for a in remediation.actions if a.column_name == "Registration_Date"]
+    assert len(date_actions) == 1
+    assert date_actions[0].count_affected == 2
+    assert date_actions[0].notes is not None and "1" in date_actions[0].notes
+
+
+def test_downloaded_cleaned_csv_reloads_cleanly():
+    """Definition-of-done requirement: the cleaned CSV must actually be
+    valid when re-loaded, not just successfully generated."""
+    import io
+
+    dataset_profile = load_dataset(TEST_DATASET_CSV, "test_dataset.csv")
+    result = run_pipeline_for_table(dataset_profile, "test_dataset.csv", use_ai_phrasing=False)
+    remediation = remediate_table(
+        result.dataframe, result.findings, result.duplication_result.exact_duplicate_row_indexes,
+    )
+
+    csv_bytes = remediation.cleaned_dataframe.to_csv(index=False).encode("utf-8")
+    buffer = io.BytesIO(csv_bytes)
+    buffer.name = "cleaned.csv"
+    reloaded_profile = load_dataset(buffer, "cleaned.csv")
+
+    assert reloaded_profile.row_count == len(remediation.cleaned_dataframe)
+    assert reloaded_profile.column_count == len(remediation.cleaned_dataframe.columns)
+    # The comma-formatted Annual_Revenue values must have actually been
+    # written out cleaned, not just cleaned in memory.
+    assert not reloaded_profile.dataframe["Annual_Revenue"].astype(str).str.contains(",").any()
+
+
+# ---- Tier 1: core/chart_generation.py --------------------------------------
+
+def test_chart_generation_makes_one_chart_per_column_with_matching_annotations():
+    dataset_profile = load_dataset(TEST_DATASET_CSV, "test_dataset.csv")
+    result = run_pipeline_for_table(dataset_profile, "test_dataset.csv", use_ai_phrasing=False)
+
+    charts = generate_charts_for_table(result.dataframe, dataset_profile.column_types, result.findings)
+
+    assert len(charts) == dataset_profile.column_count
+    chart_by_column = {chart.column_name: chart for chart in charts}
+
+    # Contact_Number has a missing_data Finding -- its chart must carry
+    # an annotation built from that Finding's own percentage.
+    contact_chart = chart_by_column["Contact_Number"]
+    assert contact_chart.annotation is not None
+    assert "37.5" in contact_chart.annotation
+
+    # Annual_Revenue is numeric -- must get a distribution chart, not a
+    # category-count chart.
+    assert chart_by_column["Annual_Revenue"].chart_type == "numeric_distribution"
+    assert chart_by_column["Registration_Date"].chart_type == "date_over_time"
+
+
 if __name__ == "__main__":
     # Allow running as a plain script too: python tests/test_pipeline.py
     import traceback
@@ -731,6 +1027,18 @@ if __name__ == "__main__":
         test_completely_empty_file_raises_a_clean_error,
         test_header_only_file_raises_a_clean_error,
         test_single_column_file_runs_the_full_pipeline_without_crashing,
+        test_remediation_numeric_fix_strips_valid_grouping_but_leaves_ambiguous_values,
+        test_remediation_declines_a_fully_ambiguous_numeric_column,
+        test_remediation_date_fix_normalizes_unambiguous_dates_but_leaves_ambiguous_ones,
+        test_remediation_leading_year_dates_with_small_day_and_month_are_not_flagged_ambiguous,
+        test_remediation_trims_whitespace_only_never_touches_casing,
+        test_remediation_declines_text_fix_when_only_casing_differs,
+        test_remediation_removes_exact_duplicate_rows_reusing_given_indexes,
+        test_remediation_never_silently_drops_missing_data_fuzzy_or_structural_findings,
+        test_remediation_never_mutates_the_caller_dataframe_or_touches_the_score,
+        test_remediation_matches_known_test_dataset_issues,
+        test_downloaded_cleaned_csv_reloads_cleanly,
+        test_chart_generation_makes_one_chart_per_column_with_matching_annotations,
     ]
     failures = 0
     for test_function in test_functions:

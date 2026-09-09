@@ -42,10 +42,13 @@ page's markup.
 """
 
 import html
+import re
 
 import streamlit as st
 
 from core.pipeline import run_multi_table_pipeline
+from core.remediation import remediate_table
+from core.chart_generation import generate_charts_for_table
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +460,135 @@ def _count_chip_html(count: int, label: str, tier_alias: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Tier 1: cleaning summary, cleaned-CSV download, and the per-column
+# dashboard. See core/remediation.py and core/chart_generation.py for the
+# actual logic -- this section is only ever presentation, same split as
+# every other part of this file.
+# ---------------------------------------------------------------------------
+
+# Plain-language label for each action_type core/remediation.py can
+# produce -- one place to keep this readable-name mapping, same idea as
+# SEVERITY_META above.
+_ACTION_TYPE_LABELS = {
+    "strip_numeric_formatting": "Stripped number formatting",
+    "normalize_date_format": "Normalized date format",
+    "trim_whitespace": "Trimmed whitespace",
+    "remove_exact_duplicate_rows": "Removed exact duplicate row(s)",
+}
+
+
+def _safe_filename_stub(table_name: str) -> str:
+    """Turns a table name (a filename or sheet name, straight from the
+    user's own upload) into something safe to put in a download
+    filename -- strips anything that isn't a letter, digit, underscore
+    or hyphen, so odd characters in an uploaded file's name can never
+    break the generated download."""
+    stub = re.sub(r"[^A-Za-z0-9_-]+", "_", table_name).strip("_")
+    return stub or "table"
+
+
+def _remediation_actions_table_html(actions) -> str:
+    """Same hand-built HTML table pattern as _per_column_table_html --
+    kept as one row per action, with a stacked note row underneath when
+    an action left some genuinely ambiguous values untouched (see
+    RemediationAction.notes' docstring for why that's shown, not hidden)."""
+    rows = []
+    for action in actions:
+        label = _ACTION_TYPE_LABELS.get(action.action_type, action.action_type)
+        rows.append(f"""
+            <tr>
+              <td>{_html(action.column_name)}</td>
+              <td>{_html(label)}</td>
+              <td class="num">{action.count_affected}</td>
+              <td>{_html(action.before_example)}</td>
+              <td>{_html(action.after_example)}</td>
+            </tr>
+        """)
+        if action.notes:
+            rows.append(f'<tr><td colspan="5"><div class="mdq-table-sub" style="margin:0;">ℹ️ {_html(action.notes)}</div></td></tr>')
+    return f"""
+        <div class="mdq-table-wrap">
+          <table class="mdq-table">
+            <thead>
+              <tr><th>Column</th><th>Fix Applied</th><th class="num">Count</th><th>Before</th><th>After</th></tr>
+            </thead>
+            <tbody>{"".join(rows)}</tbody>
+          </table>
+        </div>
+    """
+
+
+def render_remediation_section(table_result) -> None:
+    """
+    Tier 1's whole UI: cleaning summary, cleaned-CSV download, and the
+    dashboard -- rendered inside the SAME per-table expander as the
+    diagnostic score (render_table_section), but visually separated by a
+    divider and its own banner making explicit that the score above is
+    always about the ORIGINAL data. Cleaning is a separate, optional
+    output path -- see core/remediation.py's module docstring for why
+    that separation is a hard project requirement, not a UI choice.
+    """
+    remediation = remediate_table(
+        table_result.dataframe, table_result.findings, table_result.duplication_result.exact_duplicate_row_indexes,
+    )
+
+    st.divider()
+    render_html(
+        '<div class="mdq-section-title" style="margin-top:0;">🧹 Cleaned Data & Dashboard</div>'
+        '<div class="mdq-banner mdq-banner-warn" style="margin-top:0;">'
+        "This is a separate, optional output. The score above is always computed from the "
+        "<b>original</b> data -- nothing below it ever changes that score.</div>"
+    )
+
+    # -- Cleaning summary --------------------------------------------------
+    render_html('<div class="mdq-table-sub" style="margin-top:.2rem;">Fixes actually applied</div>')
+    if remediation.actions:
+        render_html(_remediation_actions_table_html(remediation.actions))
+    else:
+        render_html('<div class="mdq-banner mdq-banner-warn">No safe automatic fix applied to this table.</div>')
+
+    if remediation.manual_review:
+        with st.expander(f"🙋 Needs manual review · {len(remediation.manual_review)} item(s)", expanded=False):
+            for index, item in enumerate(remediation.manual_review):
+                with st.container(border=True):
+                    render_html(
+                        f'<div class="mdq-finding-text">'
+                        f'<b>{_html(item.finding.column_name)}</b> '
+                        f'<span class="mdq-tag-table">{_html(item.finding.issue_type)}</span>'
+                        f"<br/>{_html(item.reason)}</div>"
+                    )
+
+    # -- Download -----------------------------------------------------------
+    csv_bytes = remediation.cleaned_dataframe.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "⬇️ Download cleaned dataset (CSV)",
+        data=csv_bytes,
+        file_name=f"{_safe_filename_stub(table_result.table_name)}_cleaned.csv",
+        mime="text/csv",
+        key=f"download-cleaned-{table_result.table_name}",
+    )
+
+    # -- Dashboard ------------------------------------------------------------
+    with st.expander("📊 Dashboard", expanded=False):
+        charts = generate_charts_for_table(table_result.dataframe, table_result.column_types, table_result.findings)
+        for chart in charts:
+            annotation_html = (
+                f' <span style="color:var(--moderate); font-size:.82rem; font-weight:600;">{_html(chart.annotation)}</span>'
+                if chart.annotation else ""
+            )
+            render_html(f'<div class="mdq-finding-text" style="margin:.9rem 0 .3rem;"><b>{_html(chart.column_name)}</b>{annotation_html}</div>')
+
+            if chart.chart_data is None:
+                render_html('<div class="mdq-table-sub">Not enough data in this column to chart.</div>')
+                continue
+
+            if chart.chart_type == "date_over_time":
+                st.line_chart(chart.chart_data, height=220)
+            else:
+                st.bar_chart(chart.chart_data, height=220)
+
+
+# ---------------------------------------------------------------------------
 # AI-touched content: a consistent, clickable "see for yourself" pattern
 # used for both AI-phrased findings and calibration badges (requirement 4).
 # ---------------------------------------------------------------------------
@@ -794,6 +926,8 @@ def render_table_section(table_result):
             render_finding_list(table_result.findings, show_table_name=False, key_prefix=table_result.table_name)
         else:
             render_html('<div class="mdq-banner mdq-banner-good">✅ No issues found — this table looks clean!</div>')
+
+        render_remediation_section(table_result)
 
 
 def main():

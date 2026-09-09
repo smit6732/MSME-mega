@@ -18,10 +18,12 @@ happens when I upload a file."
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+import pandas as pd
+
 from core.ingestion import load_all_tables, DatasetProfile
 from core.completeness import check_completeness
 from core.consistency import check_consistency
-from core.duplication import check_duplication
+from core.duplication import check_duplication, DuplicationResult
 from core.structure import check_structure
 from core.scoring import build_scorecard, ScorecardResult
 from core.fixlist import generate_fix_list
@@ -42,6 +44,20 @@ class TableResult:
     duplicate_threshold: ThresholdCalibration   # similarity cutoff actually used
     critical_cutoff: ThresholdCalibration        # % cutoff actually used
     moderate_cutoff: ThresholdCalibration
+    # The already-loaded dataframe THIS scorecard was computed from, and
+    # the already-computed duplication result (which carries
+    # exact_duplicate_row_indexes). Both are carried through here purely
+    # so Tier 1 (core/remediation.py, called from app.py) can reuse them
+    # directly -- "Finding-driven, not a fresh scan" also means not
+    # re-loading or re-running duplication detection a second time.
+    # Neither field is read by anything that computes a score: adding
+    # them changes nothing about how `scorecard` above was built.
+    dataframe: Optional[pd.DataFrame] = None
+    duplication_result: Optional[DuplicationResult] = None
+    # column_types, straight from DatasetProfile -- the same type
+    # inference (numeric/text/date/boolean) core/chart_generation.py
+    # reuses to decide each column's chart, rather than re-detecting types.
+    column_types: dict = field(default_factory=dict)
     # Both straight from DatasetProfile (core/ingestion.py) -- carried
     # through here so app.py can show them without reaching past this
     # orchestration layer back into ingestion internals. 0 / None are the
@@ -115,6 +131,9 @@ def run_pipeline_for_table(dataset_profile: DatasetProfile, table_name: str, use
         duplicate_threshold=duplicate_threshold,
         critical_cutoff=critical_cutoff,
         moderate_cutoff=moderate_cutoff,
+        dataframe=dataset_profile.dataframe,
+        duplication_result=duplication_result,
+        column_types=dataset_profile.column_types,
         skipped_preamble_rows=dataset_profile.skipped_preamble_rows,
         encoding_warning=dataset_profile.encoding_warning,
     )

@@ -118,6 +118,8 @@ core/
   fixlist.py       # raw issues -> calibrated severity -> templated Finding objects
   llm_phrasing.py  # optional local-LLM rephrasing layer, strictly boxed in (see above)
   pipeline.py       # orchestrates one table, and multiple tables/files, into one summary
+  remediation.py    # Tier 1: Finding-driven auto-cleaning (see "Tier 1" below) -- never re-scans the data
+  chart_generation.py # Tier 1: one chart's worth of data per column, tied back to Tier 0's Findings
 templates/
   fix_templates.py # sentence templates used by fixlist.py (no AI, pure Python)
 scripts/
@@ -183,8 +185,30 @@ Real Tally/POS exports (the exact source named in this project's own problem sta
 
 **Known limitation, by design (not automated):** merged cells and formula-heavy Excel exports aren't specially handled. An automated "correction" here risks misinterpreting real data as a merge artifact (or the reverse) — a wrong automated guess would be worse than an honest gap. If a sheet like this produces a confusing score, that's this limitation, not a bug to silently work around.
 
-## Regression: date-type inference false positives on non-date data (`core/ingestion.py`)
+## Tier 1 — AI/BI-ready cleaned export + auto-generated dashboard (`core/remediation.py`, `core/chart_generation.py`)
 
-Found via a real user-supplied sensor/IoT alerts log (not MSME business data): a bare zero-padded ID column (`"0001"` repeated) and a bare time-of-day column (`"23:49:28"`, no date component) were both misclassified as a date column, because `_looks_like_date`'s pandas fallback silently accepted a 4-digit string as "the year" and a bare time as "today's date + that time." This cascaded into a bogus 100%-fuzzy-duplicate-rows finding and a meaningfully deflated overall score (62.0 vs. the correct 87.0) — and, worse, meant the inferred type for a bare-time column could silently depend on which calendar day the tool happened to run, breaking this project's own "same file twice → same result" guarantee.
+Tier 0 diagnoses; Tier 1 optionally *acts* on that diagnosis — producing a cleaned CSV per table and a per-column dashboard. It sits entirely on top of Tier 0 and changes nothing about how a score is computed.
 
-Fixed with a shape guard before the pandas fallback is trusted: a value must contain a date-like separator, a month name, or be a compact 8-digit date, and must not be a bare `HH:MM:SS`. Verified against the real file (score corrected 62.0 → 87.0, confirmed live in the browser) and locked in with 3 regression tests, including one confirming genuine dot-separated/compact dates that only match via the pandas fallback still classify correctly.
+**Finding-driven, not a fresh scan.** `remediate_table()` never re-inspects the raw data to decide something is wrong — it only ever reads `TableResult.findings`, the exact `Finding` objects `core/fixlist.py` already built, and decides, per Finding, whether *that already-identified problem* can be fixed safely and automatically. The one exception is exact-duplicate removal, which reuses `core/duplication.py`'s own `exact_duplicate_row_indexes` directly rather than recomputing them.
+
+**The score is always about the original data.** `remediate_table()` works on a `.copy()` of the table's dataframe; the object the scorecard was computed from is never touched. `test_remediation_never_mutates_the_caller_dataframe_or_touches_the_score` in `tests/test_pipeline.py` asserts this directly — Tier 1 existing in the codebase, or even running, cannot change Tier 0's score for the same file.
+
+**Finding `issue_type` → what happens:**
+
+| `issue_type` | Auto-fixed? | Why / how |
+|---|---|---|
+| `missing_data` | No | No safe universal way to guess a blank cell's value. |
+| `inconsistent_format_numeric` | Guarded | Strips thousands separators/currency symbols (`"25,00,000"` → `"2500000"`) only when the grouping unambiguously fits Indian (last group 3 digits, middle groups 2 digits) or Western (all groups 3 digits) convention, and there's at most one decimal point. A value like `"1,2,345"` — matching neither convention — is left untouched. |
+| `inconsistent_format_date` | Guarded | Normalizes to `YYYY-MM-DD`. A **leading** 4-digit year (e.g. `"2021-01-10"`) is trusted positionally as already `YYYY-MM-DD`. A **trailing** year (e.g. `"15-03-2019"`) is only reordered when exactly one of the other two components is `> 12` (so it can't be a month) — `"03-04-2020"` is genuinely ambiguous (3 April or 4 March?) and is left untouched, matching the project's "never guess" rule everywhere else. |
+| `inconsistent_format_text` | Yes | Trims leading/trailing whitespace only. Casing is deliberately out of scope — there's no objectively "correct" case — so a Finding that's entirely a casing difference declines with a stated reason instead of claiming a no-op fix. |
+| `exact_duplicate_rows` | Yes | Drops exactly the rows in `duplication_result.exact_duplicate_row_indexes` (reused, never recomputed). |
+| `fuzzy_duplicate_rows` | No | Deciding which near-duplicate spelling is correct, or how to merge them, needs a human. |
+| `structural_issue` | No | E.g. a duplicate identifier (same GST/PAN on two different businesses) — no way to know which row holds the correct value. |
+
+**Nothing silent.** Every Finding lands in exactly one place: `RemediationResult.actions` (an applied fix, with a real before/after pair) or `RemediationResult.manual_review` (a plain-language reason). A column that's *mostly* fixable but has a few genuinely ambiguous values also gets an honest note (e.g. *"1 date in this column was ambiguous and left unchanged"*) rather than looking identical, in the audit log, to a column with none. `tests/test_pipeline.py::test_remediation_never_silently_drops_missing_data_fuzzy_or_structural_findings` guards this directly.
+
+**Dashboard (`core/chart_generation.py`).** One chart per column, keyed on the column type `core/ingestion.py` already inferred (never re-detected): numeric → distribution histogram, text/categorical → top-10 + "Other" value-count bars, date → record count per month. When a column has a matching Finding, its chart is annotated straight from that Finding's own `percentage_affected` (e.g. *"⚠ 37.5% missing"*) — never recomputed — so the dashboard and the diagnosis can never tell two different stories about the same column.
+
+**UI** (`app.py::render_remediation_section`): a clearly separate block under each table's existing diagnostic detail, with its own banner stating the score above is always about the original data. Shows the cleaning summary table, a "needs manual review" list, a per-table cleaned-CSV download button, and the dashboard.
+
+**Verified against `test_dataset.csv`** (a real 40-row sample with planted issues): the exact duplicate ("Krishna Enterprises", appearing twice identically) is removed; all 5 comma-formatted `Annual_Revenue` values (e.g. `"25,00,000"`) are cleaned; `Contact_Number`'s 37.5%-missing data is correctly left on manual review, never guessed at; `Registration_Date`'s 2 unambiguous DD-MM-YYYY values are normalized while its 1 genuinely ambiguous one is left untouched. `tests/test_pipeline.py::test_remediation_matches_known_test_dataset_issues` pins these exact numbers.
