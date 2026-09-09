@@ -1,6 +1,7 @@
 pandas
 numpy
 openpyxl
+charset-normalizer
 rapidfuzz
 streamlit
 pytest

@@ -470,6 +470,179 @@ def test_pipeline_works_end_to_end_with_ai_phrasing_disabled():
         assert finding.display_description == finding.rule_based_description
 
 
+# ---- Priority 1: preamble/title-row detection (core/ingestion.py) ---------
+
+def _bytes_buffer(text: str, name: str):
+    """Builds a Streamlit-uploader-shaped in-memory file (bytes + .name)
+    from a text string, matching how load_dataset actually receives
+    uploads in the app (not a path on disk)."""
+    import io
+    buffer = io.BytesIO(text.encode("utf-8"))
+    buffer.name = name
+    return buffer
+
+
+def test_preamble_row_is_detected_and_skipped_on_csv():
+    """A genuine Tally/POS-style export: a report-title line, a blank
+    line, then the real header. The heuristic should find the clear
+    width jump and skip both leading lines -- and DatasetProfile must
+    report exactly how many, per the "never silent" requirement."""
+    csv_text = (
+        "Shree Balaji Traders - Sales Register\n"
+        "\n"
+        "Business_Name,GST_Number,City,Annual_Revenue\n"
+        "Patel Hardware,24AAAAA0000A1Z5,Ahmedabad,1500000\n"
+        "Shah Textiles,24BBBBB1111B1Z6,Surat,2200000\n"
+        "Modi Foods,24CCCCC2222C1Z7,Vadodara,980000\n"
+    )
+    profile = load_dataset(_bytes_buffer(csv_text, "preamble.csv"), "preamble.csv")
+    assert profile.skipped_preamble_rows == 2
+    assert list(profile.dataframe.columns) == ["Business_Name", "GST_Number", "City", "Annual_Revenue"]
+    assert profile.row_count == 3
+
+    # The rest of the pipeline must work normally on the correctly-
+    # parsed table -- and raw_text must be rebuilt from the real header
+    # onward, or structure.py's ragged-row check would misfire on the
+    # intentionally-skipped preamble line.
+    result = run_pipeline_for_table(profile, "preamble.csv", use_ai_phrasing=False)
+    assert 0 <= result.scorecard.overall_score <= 100
+    ragged_row_findings = [f for f in result.findings if f.issue_type == "structural_issue" and "ragged" in f.rule_based_description.lower()]
+    assert ragged_row_findings == []
+
+
+def test_file_without_preamble_is_completely_unaffected():
+    """No regression case: an ordinary file (header already on row 0)
+    must behave exactly as before -- skipped_preamble_rows stays 0, and
+    every existing assertion about messy_msme_sample.csv still holds."""
+    dataset_profile = load_dataset(SINGLE_TABLE_CSV, "messy_msme_sample.csv")
+    assert dataset_profile.skipped_preamble_rows == 0
+    assert dataset_profile.row_count == 20
+    assert dataset_profile.column_count == 9
+
+
+def test_narrow_table_does_not_trigger_preamble_detection():
+    """Ambiguous case, per the guard-and-fallback design: a genuinely
+    narrow (2-column) table gives the heuristic too little signal to
+    trust, so it must fall back to "row 0 is the header" rather than
+    guess -- exactly the same discipline core/calibration.py uses."""
+    csv_text = "Name,Value\nA,1\nB,2\nC,3\n"
+    profile = load_dataset(_bytes_buffer(csv_text, "narrow.csv"), "narrow.csv")
+    assert profile.skipped_preamble_rows == 0
+    assert list(profile.dataframe.columns) == ["Name", "Value"]
+
+
+def test_preamble_row_is_detected_and_skipped_on_excel():
+    """The same detection applies to Excel workbooks, not just CSV --
+    Tally/POS Excel exports have the identical letterhead-then-header
+    shape."""
+    import io
+    import pandas as pd
+
+    data = pd.DataFrame({
+        "Business_Name": ["Patel Hardware", "Shah Textiles", "Modi Foods"],
+        "GST_Number": ["24AAAAA0000A1Z5", "24BBBBB1111B1Z6", "24CCCCC2222C1Z7"],
+        "City": ["Ahmedabad", "Surat", "Vadodara"],
+    })
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        title_row = pd.DataFrame([["Shree Balaji Traders - Sales Register", None, None]])
+        title_row.to_excel(writer, sheet_name="Sheet1", index=False, header=False, startrow=0)
+        data.to_excel(writer, sheet_name="Sheet1", index=False, startrow=2)
+    buffer.seek(0)
+    buffer.name = "preamble.xlsx"
+
+    profile = load_dataset(buffer, "preamble.xlsx")
+    assert profile.skipped_preamble_rows == 2
+    assert list(profile.dataframe.columns) == ["Business_Name", "GST_Number", "City"]
+    assert profile.row_count == 3
+
+
+# ---- Priority 2: encoding fallback (core/ingestion.py) --------------------
+
+def test_non_utf8_csv_is_read_via_fallback_with_a_visible_warning():
+    """A Windows-1252-encoded file (the realistic failure mode named in
+    the project brief -- older/regional Windows exports) must not raise
+    UnicodeDecodeError, and the fallback must be visible, never silent --
+    a clean UTF-8 file must show no such warning at all."""
+    import io
+
+    text = (
+        "Business_Name,City,Contact_Person\r\n"
+        "Café Milano,Mumbai,André Fernandes\r\n"
+        "Patel Hardware,Ahmedabad,Suresh Patel\r\n"
+    )
+    buffer = io.BytesIO(text.encode("windows-1252"))
+    buffer.name = "non_utf8.csv"
+
+    profile = load_dataset(buffer, "non_utf8.csv")
+    assert profile.row_count == 2
+    assert profile.encoding_warning is not None
+    assert "UTF-8" in profile.encoding_warning
+    # The accented business name must still come through readably, not
+    # as a raw decode failure -- this is what makes the fallback worth
+    # having at all, rather than just always using latin-1.
+    assert "Caf" in profile.dataframe["Business_Name"].iloc[0]
+
+    # Full pipeline must still run cleanly on the fallback-decoded table.
+    result = run_pipeline_for_table(profile, "non_utf8.csv", use_ai_phrasing=False)
+    assert 0 <= result.scorecard.overall_score <= 100
+
+
+def test_clean_utf8_csv_gets_no_encoding_warning():
+    dataset_profile = load_dataset(SINGLE_TABLE_CSV, "messy_msme_sample.csv")
+    assert dataset_profile.encoding_warning is None
+
+
+# ---- Priority 3: degenerate file edge cases --------------------------------
+
+def test_completely_empty_file_raises_a_clean_error():
+    import io
+
+    buffer = io.BytesIO(b"")
+    buffer.name = "empty.csv"
+    try:
+        load_dataset(buffer, "empty.csv")
+        assert False, "expected a ValueError for a completely empty file"
+    except ValueError as error:
+        assert "empty" in str(error).lower()
+
+
+def test_header_only_file_raises_a_clean_error():
+    """A file with column headers but zero data rows must not crash --
+    it should raise the same kind of clean, friendly ValueError app.py
+    already knows how to display, not an unhandled pandas exception."""
+    import io
+
+    buffer = io.BytesIO(b"Business_Name,City,Revenue\n")
+    buffer.name = "header_only.csv"
+    try:
+        load_dataset(buffer, "header_only.csv")
+        assert False, "expected a ValueError for a file with no data rows"
+    except ValueError as error:
+        assert "no data" in str(error).lower()
+
+
+def test_single_column_file_runs_the_full_pipeline_without_crashing():
+    """Every one of the four checks, scoring, and fix-list generation
+    must handle a one-column table -- completeness/consistency work per-
+    column regardless of column count, duplication's identity-column
+    picker has only one candidate, and structure's checks don't assume
+    more than one column exists."""
+    import io
+
+    buffer = io.BytesIO(b"Business_Name\nPatel Hardware\nShah Textiles\nPatel Hardware\n")
+    buffer.name = "single_column.csv"
+    profile = load_dataset(buffer, "single_column.csv")
+    assert profile.column_count == 1
+
+    result = run_pipeline_for_table(profile, "single_column.csv", use_ai_phrasing=False)
+    assert 0 <= result.scorecard.overall_score <= 100
+    # The planted exact duplicate ("Patel Hardware" twice) must still be
+    # caught even with only one column to work with.
+    duplication_findings = [f for f in result.findings if f.check_type == "duplication"]
+    assert len(duplication_findings) >= 1
+
+
 if __name__ == "__main__":
     # Allow running as a plain script too: python tests/test_pipeline.py
     import traceback
@@ -496,6 +669,15 @@ if __name__ == "__main__":
         test_same_file_processed_twice_gives_identical_results,
         test_ai_phrasing_falls_back_cleanly_when_model_unavailable,
         test_pipeline_works_end_to_end_with_ai_phrasing_disabled,
+        test_preamble_row_is_detected_and_skipped_on_csv,
+        test_file_without_preamble_is_completely_unaffected,
+        test_narrow_table_does_not_trigger_preamble_detection,
+        test_preamble_row_is_detected_and_skipped_on_excel,
+        test_non_utf8_csv_is_read_via_fallback_with_a_visible_warning,
+        test_clean_utf8_csv_gets_no_encoding_warning,
+        test_completely_empty_file_raises_a_clean_error,
+        test_header_only_file_raises_a_clean_error,
+        test_single_column_file_runs_the_full_pipeline_without_crashing,
     ]
     failures = 0
     for test_function in test_functions:

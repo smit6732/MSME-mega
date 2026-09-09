@@ -734,12 +734,35 @@ def render_finding_card(finding, show_table_name: bool, key_prefix: str) -> None
             _render_ai_provenance_popover(finding, popover_key=f"ai-{key_prefix}")
 
 
+def render_ingestion_notices(table_result) -> None:
+    """
+    Surfaces anything core/ingestion.py had to silently-would-be-wrong-
+    to-hide: a detected-and-skipped preamble/title row (core/ingestion.py
+    Priority 1), or a non-UTF-8 encoding fallback (Priority 2). Both are
+    "never silent" by the project's own rule -- this is the one place
+    that rule is actually enforced in the UI, so a skipped row or a
+    guessed encoding is always visible right where the rest of that
+    table's detail is, not buried in a log no one reads.
+    """
+    if table_result.skipped_preamble_rows > 0:
+        row_word = "row" if table_result.skipped_preamble_rows == 1 else "rows"
+        render_html(
+            f'<div class="mdq-banner mdq-banner-warn">📄 Detected and skipped '
+            f'{table_result.skipped_preamble_rows} header {row_word} before the actual '
+            f"data (e.g. a report title or company letterhead line) — the real column "
+            f"headers were found further down and used instead.</div>"
+        )
+    if table_result.encoding_warning:
+        render_html(f'<div class="mdq-banner mdq-banner-warn">🔤 {_html(table_result.encoding_warning)}</div>')
+
+
 def render_table_section(table_result):
     """One table's own detail: score breakdown, calibrated thresholds
     used, per-column table, and its own fix list."""
     header = f"{score_indicator(table_result.scorecard.overall_score)} — {table_result.table_name} ({table_result.scorecard.overall_score:.1f}/100)"
     with st.expander(header, expanded=False):
         render_html(f'<div class="mdq-table-sub">{table_result.row_count} rows × {table_result.column_count} columns</div>')
+        render_ingestion_notices(table_result)
 
         render_html(_dimension_grid_html(table_result.scorecard))
 

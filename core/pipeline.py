@@ -16,7 +16,7 @@ happens when I upload a file."
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 from core.ingestion import load_all_tables, DatasetProfile
 from core.completeness import check_completeness
@@ -42,6 +42,13 @@ class TableResult:
     duplicate_threshold: ThresholdCalibration   # similarity cutoff actually used
     critical_cutoff: ThresholdCalibration        # % cutoff actually used
     moderate_cutoff: ThresholdCalibration
+    # Both straight from DatasetProfile (core/ingestion.py) -- carried
+    # through here so app.py can show them without reaching past this
+    # orchestration layer back into ingestion internals. 0 / None are the
+    # "nothing to report" values -- see ingestion.py's own docstrings for
+    # what each one means and why it's never silently swallowed.
+    skipped_preamble_rows: int = 0
+    encoding_warning: Optional[str] = None
 
 
 @dataclass
@@ -108,6 +115,8 @@ def run_pipeline_for_table(dataset_profile: DatasetProfile, table_name: str, use
         duplicate_threshold=duplicate_threshold,
         critical_cutoff=critical_cutoff,
         moderate_cutoff=moderate_cutoff,
+        skipped_preamble_rows=dataset_profile.skipped_preamble_rows,
+        encoding_warning=dataset_profile.encoding_warning,
     )
 
 

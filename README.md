@@ -128,6 +128,8 @@ sample_data/
   messy_msme_sample.csv          # 20-row single-table sample with realistic data issues
   realistic_msme_directory.csv   # 168-row larger single-table sample
   multi_sheet_msme_workbook.xlsx # 4-sheet workbook: 3 messy differently, 1 deliberately empty
+  preamble_test.csv              # a report-title line before the real header (see "Ingestion robustness")
+  regional_language_sample.csv   # genuine Hindi/Gujarati business names (see "Ingestion robustness")
 tests/
   test_pipeline.py # end-to-end smoke tests (see "Running the tests" above)
 app.py              # Streamlit dashboard
@@ -169,3 +171,14 @@ python scripts/profile_pipeline.py sample_data/messy_msme_sample.csv sample_data
 ```
 
 The local-LLM fix-list phrasing (`core/fixlist.py`'s `MAX_FINDINGS_TO_AI_PHRASE`) was already capped at the 15 most severe findings per table before this investigation — measurement confirmed it does *not* scale with row count (the number of findings is bounded by column count, not row count), so no change was needed there.
+
+## Ingestion robustness (`core/ingestion.py`)
+
+Real Tally/POS exports (the exact source named in this project's own problem statement) aren't always a clean table starting at row 0. Two guarded fallbacks, both following the same philosophy as `core/calibration.py` — take confident action, or fall back to the safe default, but never silently guess and never hide that a fallback happened:
+
+- **Preamble/title-row detection.** A report title or company letterhead line above the real header is common in these exports. `_detect_header_row_index` scans the first ~10 rows for a clear width jump — a real header (and the rows after it) is consistently much wider than a title line with only 1-2 populated cells. It only acts when that jump is unambiguous; anything else (a genuinely narrow table, no clear gap, multiple similarly-wide candidate rows) falls back to "row 0 is the header", exactly the previous behavior. Works for both CSV and Excel. Never silent: `DatasetProfile.skipped_preamble_rows` reports the count, and the UI shows *"Detected and skipped N header row(s) before the actual data"* whenever it's non-zero. See `sample_data/preamble_test.csv` for a live example.
+- **Encoding fallback.** CSV loading tries UTF-8 first, then asks `charset-normalizer` to detect the actual encoding, then falls back to Latin-1 (which never raises) as a last resort. Worth knowing if you're ever asked to justify this live: testing found that charset-normalizer's own confidence score (`chaos == 0.0`) does **not** reliably tell apart similar single-byte Western codepages (it detected `cp1250` instead of the actual `cp1252` on realistic MSME-style test content, even at ~1KB) — so `DatasetProfile.encoding_warning` is set, and shown in the UI, whenever a file needed *any* fallback from clean UTF-8, not only when the detector's own score looked uncertain. Overclaiming confidence the detector doesn't actually have would contradict this project's own honesty-about-uncertainty standard everywhere else (calibration, AI phrasing).
+
+**Regional-language data (Hindi/Gujarati script):** tested directly against `sample_data/regional_language_sample.csv` (genuine Devanagari and Gujarati business names, not transliterated) rather than guess-fixed. Result: works correctly with no changes needed. Ingestion, type inference (correctly "text", never misclassified), the consistency check's casing/whitespace logic (a correct no-op — these scripts have no case distinction), and RapidFuzz duplicate matching (correctly scored a genuine single-character Devanagari near-duplicate at 97.87% similarity) all behaved exactly as they do for Latin-script data.
+
+**Known limitation, by design (not automated):** merged cells and formula-heavy Excel exports aren't specially handled. An automated "correction" here risks misinterpreting real data as a merge artifact (or the reverse) — a wrong automated guess would be worse than an honest gap. If a sheet like this produces a confusing score, that's this limitation, not a bug to silently work around.
