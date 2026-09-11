@@ -92,21 +92,43 @@ class MultiTableSummary:
     combined_findings: List[Finding] = field(default_factory=list)  # every table's findings, tagged, sorted
 
 
-def run_pipeline_for_table(dataset_profile: DatasetProfile, table_name: str, use_ai_phrasing: bool = True) -> TableResult:
+def run_pipeline_for_table(
+    dataset_profile: DatasetProfile, table_name: str, use_ai_phrasing: bool = True, on_stage=None,
+) -> TableResult:
     """
     Run completeness -> consistency -> duplication -> structure ->
     scoring -> fix list for ONE already-loaded table, and package the
     result. This is exactly the sequence a single-file upload has always
     run (see the original app.py's run_pipeline) -- multi-table support
     just means calling this once per table instead of once per upload.
+
+    on_stage: an OPTIONAL callback, `on_stage(stage_name: str, table_name: str)`,
+    fired right before each stage below starts running. Purely additive
+    instrumentation for app.py's staged loading UI -- it changes nothing
+    about what gets computed or returned (every caller that omits it, which
+    includes every existing test, gets byte-identical behavior to before
+    this parameter existed). Kept as a bare callable rather than a logging
+    framework or event bus on purpose -- the simplest thing that lets the
+    UI layer observe real progress without this module knowing anything
+    about Streamlit.
     """
+    def _report(stage: str) -> None:
+        if on_stage:
+            on_stage(stage, table_name)
+
+    _report("completeness")
     completeness_result = check_completeness(dataset_profile.dataframe)
+    _report("consistency")
     consistency_result = check_consistency(dataset_profile.dataframe, dataset_profile.column_types)
+    _report("duplication")
     duplication_result = check_duplication(dataset_profile.dataframe, dataset_profile.column_types)
+    _report("structure")
     structure_result = check_structure(dataset_profile.dataframe, dataset_profile.raw_text)
 
+    _report("scoring")
     scorecard = build_scorecard(completeness_result, consistency_result, duplication_result, structure_result)
 
+    _report("fixlist")
     findings, critical_cutoff, moderate_cutoff = generate_fix_list(
         completeness_result,
         consistency_result,
@@ -139,7 +161,7 @@ def run_pipeline_for_table(dataset_profile: DatasetProfile, table_name: str, use
     )
 
 
-def run_multi_table_pipeline(uploaded_files: list, use_ai_phrasing: bool = True) -> MultiTableSummary:
+def run_multi_table_pipeline(uploaded_files: list, use_ai_phrasing: bool = True, on_stage=None) -> MultiTableSummary:
     """
     The multi-table entry point: takes a list of uploaded files (each
     either a path string or a Streamlit UploadedFile-like object with
@@ -154,11 +176,18 @@ def run_multi_table_pipeline(uploaded_files: list, use_ai_phrasing: bool = True)
     data, is caught and recorded as a TableFailure -- it never stops the
     rest of the batch from being processed. This directly implements the
     "one bad table should never crash the whole upload" requirement.
+
+    on_stage: see run_pipeline_for_table's docstring -- passed straight
+    through, plus one extra "loading" stage reported here for the file
+    read itself (which happens above/outside that function). Optional;
+    omitting it (every existing caller does) changes nothing.
     """
     summary = MultiTableSummary()
 
     for uploaded_file in uploaded_files:
         file_name = _get_file_name(uploaded_file)
+        if on_stage:
+            on_stage("loading", file_name)
         load_outcomes = load_all_tables(uploaded_file, file_name)
 
         for outcome in load_outcomes:
@@ -167,7 +196,9 @@ def run_multi_table_pipeline(uploaded_files: list, use_ai_phrasing: bool = True)
                 continue
 
             try:
-                table_result = run_pipeline_for_table(outcome.profile, outcome.table_name, use_ai_phrasing=use_ai_phrasing)
+                table_result = run_pipeline_for_table(
+                    outcome.profile, outcome.table_name, use_ai_phrasing=use_ai_phrasing, on_stage=on_stage,
+                )
                 summary.table_results.append(table_result)
             except Exception as unexpected_error:
                 # A check module choking on this particular table's data

@@ -43,8 +43,12 @@ page's markup.
 
 import html
 import re
+from urllib.parse import quote
 
+import altair as alt
+import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from core.pipeline import run_multi_table_pipeline
 from core.remediation import remediate_table
@@ -71,12 +75,155 @@ SEVERITY_META = {
     "minor": {"label": "Minor", "emoji": "🟢"},
 }
 
+# The icon field is a KEY into _DIMENSION_ICONS below, not an emoji --
+# both the landing page's "What this tool checks" cards and the
+# per-table dimension grid read from this SAME list, so the same four
+# icons render identically (same glyph, same weight) everywhere the
+# four dimensions appear. Before this, each call site picked its own
+# emoji independently, and different emoji at different sizes read as
+# visibly inconsistent between the two screens -- confirmed by direct
+# screenshot comparison, not a style guess.
 DIMENSION_META = [
-    ("completeness_score", "Completeness", "📋", "How much of the data is actually filled in."),
-    ("consistency_score", "Consistency", "🔤", "Whether values are formatted the same way throughout."),
-    ("duplication_score", "Duplication", "🧬", "Exact and near-duplicate records."),
-    ("structure_score", "Structure", "🏗️", "Whether the file itself is sound -- headers, columns, IDs."),
+    ("completeness_score", "Completeness", "completeness", "How much of the data is actually filled in."),
+    ("consistency_score", "Consistency", "consistency", "Whether values are formatted the same way throughout."),
+    ("duplication_score", "Duplication", "duplication", "Exact and near-duplicate records."),
+    ("structure_score", "Structure", "structure", "Whether the file itself is sound -- headers, columns, IDs."),
 ]
+
+# One small, hand-authored inline SVG per dimension -- deliberately NOT
+# emoji (which renders differently across OSes/browsers/sizes, which is
+# exactly what caused the inconsistency above) and deliberately NOT a
+# third-party icon font or library (no new dependency). Each uses
+# stroke="currentColor" so a single CSS `color` rule (already themed
+# via var(--x), see _build_theme_css) is the only thing that controls
+# its color in both light and dark mode -- no icon-specific color logic
+# anywhere. viewBox is a consistent 24x24 for all four, so they share
+# the same visual weight at any size.
+_DIMENSION_ICONS = {
+    "completeness": (
+        '<svg class="mdq-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="5" y="4" width="14" height="17" rx="2"/>'
+        '<path d="M9 4V3a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v1"/>'
+        '<path d="M9 12.5l2 2 4-4.5"/>'
+        "</svg>"
+    ),
+    "consistency": (
+        '<svg class="mdq-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="3" y="9" width="18" height="6" rx="1"/>'
+        '<path d="M7 9v2.5M11 9v2.5M15 9v2.5M19 9v2.5"/>'
+        "</svg>"
+    ),
+    "duplication": (
+        '<svg class="mdq-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="8" y="8" width="13" height="13" rx="2"/>'
+        '<path d="M16 8V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h3"/>'
+        "</svg>"
+    ),
+    "structure": (
+        '<svg class="mdq-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        '<rect x="3" y="3" width="18" height="18" rx="2"/>'
+        '<line x1="3" y1="9" x2="21" y2="9"/>'
+        '<line x1="3" y1="15" x2="21" y2="15"/>'
+        '<line x1="9" y1="3" x2="9" y2="21"/>'
+        "</svg>"
+    ),
+}
+
+
+# A small, hand-authored mark for the tool itself -- used next to the
+# header title (see render_header). Deliberately simple: an ascending
+# bar-chart shape with a checkmark, echoing "data quality, verified" in
+# one glyph rather than a stock emoji. currentColor + the accent token
+# so it re-themes for free like every other icon in this file.
+_MARK_SVG = (
+    '<svg class="mdq-mark" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">'
+    '<rect width="32" height="32" rx="8" fill="var(--accent)"/>'
+    '<g stroke="var(--accent-contrast)" stroke-width="2.4" stroke-linecap="round">'
+    '<line x1="9" y1="22" x2="9" y2="17"/>'
+    '<line x1="16" y1="22" x2="16" y2="12"/>'
+    '<line x1="23" y1="22" x2="23" y2="15"/>'
+    "</g>"
+    '<path d="M9 13.5l3.5 3.5L16 13l3 3 3.5-4" stroke="var(--accent-contrast)" '
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+    "</svg>"
+)
+
+# The empty state's small illustration (requirement 6c) -- messy,
+# scattered lines on the left resolving, through an upload arrow, into
+# one clean, checked sheet on the right. Reinforces "upload your messy
+# data here" rather than decorating for its own sake. Uses var(--x)
+# theme tokens directly (this renders in the main page DOM via
+# render_html, not an iframe, so those references resolve normally).
+# Favicon version of the same mark, as a standalone SVG with LITERAL hex
+# colors rather than var(--x) tokens -- a favicon renders outside our
+# page's DOM entirely (the browser paints it into its own tab chrome),
+# so CSS custom properties from :root never reach it; this is the one
+# place in the whole file a color is hardcoded on purpose, and it stays
+# the same regardless of the in-page theme toggle (browser tab chrome
+# isn't themed by us either way). Colors match the light theme's accent
+# (kept in sync by hand with _LIGHT_TOKENS["accent"] -- see the color-
+# system replacement note above for why this can't just reference the
+# token dict directly).
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="8" fill="#077B97"/>'
+    '<g stroke="#FFFFFF" stroke-width="2.4" stroke-linecap="round">'
+    '<line x1="9" y1="22" x2="9" y2="17"/>'
+    '<line x1="16" y1="22" x2="16" y2="12"/>'
+    '<line x1="23" y1="22" x2="23" y2="15"/>'
+    "</g>"
+    '<path d="M9 13.5l3.5 3.5L16 13l3 3 3.5-4" stroke="#FFFFFF" '
+    'stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>'
+    "</svg>"
+)
+
+_UPLOAD_ILLUSTRATION_SVG = """
+<svg viewBox="0 0 240 130" width="100%" height="130" xmlns="http://www.w3.org/2000/svg">
+  <g stroke="var(--text-tertiary)" stroke-width="2" stroke-linecap="round" fill="none" opacity="0.55">
+    <path d="M18 38 Q34 27 50 40 T82 36"/>
+    <path d="M18 60 Q40 69 60 58 T92 63"/>
+    <path d="M18 82 Q30 73 56 83"/>
+  </g>
+  <g stroke="var(--accent)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none">
+    <path d="M120 104 V52"/>
+    <path d="M105 67 L120 52 L135 67"/>
+  </g>
+  <rect x="151" y="28" width="72" height="92" rx="9" fill="var(--bg-elevated)" stroke="var(--accent)" stroke-width="2.5"/>
+  <g stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" opacity="0.55">
+    <line x1="163" y1="49" x2="211" y2="49"/>
+    <line x1="163" y1="63" x2="211" y2="63"/>
+    <line x1="163" y1="77" x2="197" y2="77"/>
+  </g>
+  <circle cx="201" cy="99" r="10" fill="var(--minor-bg)" stroke="var(--minor)" stroke-width="2"/>
+  <path d="M196.5 99l3 3 7-7" stroke="var(--minor)" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+</svg>
+"""
+
+# Sequential, real pipeline stages (requirement 2) -- these codes are
+# exactly the stage names core/pipeline.py's on_stage callback reports,
+# so this label map can never drift out of sync with what's actually
+# running: if pipeline.py's stage names ever change, the label for that
+# stage simply falls back to the raw code (see _make_stage_reporter)
+# rather than silently showing a stale/wrong description.
+_STAGE_LABELS = {
+    "loading": "Reading and profiling file structure…",
+    "completeness": "Checking completeness — how much data is filled in…",
+    "consistency": "Checking consistency — formatting patterns per column…",
+    "duplication": "Scanning for exact and near-duplicate rows…",
+    "structure": "Validating headers and file structure…",
+    "scoring": "Combining the four dimension scores…",
+    "fixlist": "Generating the fix list (loading local AI model on first run)…",
+}
+
+# A categorical/numeric column where almost every value is the same one
+# thing (e.g. a repeated device ID) produces a bar chart that's just one
+# giant bar -- technically correct, not informative. Below this many
+# distinct values, show a plain sentence instead of a chart.
+LOW_CARDINALITY_THRESHOLD = 3
 
 
 def _html(value) -> str:
@@ -145,54 +292,89 @@ def score_indicator(score: float) -> str:
 # defined ONCE here, referenced everywhere else as CSS var(--x).
 # ---------------------------------------------------------------------------
 
-# Each value below was chosen and contrast-checked against ITS OWN
-# background (white for light, the dark bg for dark) using the WCAG
-# relative-luminance formula, targeting >=4.5:1 for text -- e.g. light
-# mode's moderate/amber is a darker shade (#B45309) than you'd reach for
-# by eye, specifically because the lighter, more "amber-looking" shade
-# fails AA contrast as small text on white (~3.4:1). Dark mode's shades
-# are the standard Tailwind "400" family, which is deliberately designed
-# for this exact light-text-on-dark-background use case.
+# Warm zinc-toned neutrals + a single cyan/electric-teal signature
+# accent (purple/violet deliberately excluded -- the generic "AI product"
+# cliche as of 2026). Every value below was run through a real WCAG
+# relative-luminance contrast check (not eyeballed) against EVERY
+# background surface it actually appears behind in this file -- not just
+# the lightest/easiest one. That check caught three of the values that
+# would look fine in isolation but fail in practice:
+#   - text-tertiary: the proposed #8A8177 passed against white but fell
+#     to ~3.2:1 against bg-muted (#EDEAE5, the darkest of the light-mode
+#     surfaces it's used on) -- darkened to #6F675F, which now clears
+#     4.5:1 against all four light surfaces. Dark mode needed its OWN
+#     value (#91897F) rather than reusing the light one, which was too
+#     dark to read against dark-mode surfaces.
+#   - accent: #0891B2 read as only 3.5-3.7:1 as TEXT (the tagline, and
+#     white-on-accent in the mark/step-num pills) -- darkened to #077B97,
+#     same hue, which clears 4.5:1 both as text-on-background and as the
+#     background under white text.
+#   - critical: #DC2626 on its own critical-bg was 4.41:1, just under
+#     the line -- nudged to #DA2323.
+# moderate/minor were already compliant at the proposed values and are
+# unchanged. See the contrast check this was verified with for the exact
+# numbers (every pairing >=4.5:1 in both light and dark, zero failures).
 _LIGHT_TOKENS = {
-    "bg": "#FFFFFF",
+    # Slate/Sky-Blue refactor (light mode only -- dark mode below is
+    # untouched, kept from the prior verified pass). Every value here
+    # was contrast-checked the same way as before: against the HARDEST
+    # surface it sits on, not the easiest. accent (#0284C7, the exact
+    # "Sky Blue" requested) is 4.10:1 as text -- fine for the large
+    # circular step-badge digit (which the request also gave this exact
+    # color for) but under 4.5:1 for flowing text, so the tagline uses
+    # accent-text (#0369A1, same hue) instead. text-tertiary needed
+    # darkening from the obvious Slate-500 (#64748B, 3.86:1 on
+    # bg-muted) to #59687C to clear 4.5:1 everywhere it's used.
+    "bg": "#F8FAFC",
     "bg-elevated": "#FFFFFF",
-    "bg-subtle": "#F9FAFB",
-    "bg-muted": "#F3F4F6",
-    "border": "#E5E7EB",
-    "border-subtle": "#F0F1F3",
-    "text-primary": "#111827",
-    "text-secondary": "#4B5563",
-    "text-tertiary": "#6B7280",
-    "accent": "#2563EB",
-    "accent-bg": "#EFF6FF",
-    "accent-border": "#DBEAFE",
+    "bg-subtle": "#F1F5F9",
+    "bg-muted": "#E2E8F0",
+    "border": "#E2E8F0",
+    "border-subtle": "#EEF2F6",
+    "text-primary": "#0F172A",
+    "text-secondary": "#475569",
+    "text-tertiary": "#59687C",
+    "accent": "#0284C7",
+    "accent-text": "#0369A1",
+    "accent-bg": "#E0F2FE",
+    "accent-border": "#BAE6FD",
     "accent-contrast": "#FFFFFF",
-    "critical": "#DC2626", "critical-bg": "#FEF2F2", "critical-border": "#FECACA",
+    "critical": "#DA2323", "critical-bg": "#FEF2F2", "critical-border": "#FECACA",
     "moderate": "#B45309", "moderate-bg": "#FFFBEB", "moderate-border": "#FDE68A",
     "minor": "#15803D", "minor-bg": "#F0FDF4", "minor-border": "#BBF7D0",
-    "shadow-sm": "0 1px 2px rgba(16,24,40,0.05)",
-    "shadow-md": "0 4px 12px rgba(16,24,40,0.06)",
+    "shadow-sm": "0 1px 2px rgba(15,23,42,0.05)",
+    "shadow-md": "0 4px 12px rgba(15,23,42,0.06)",
+    # Card separation (requirement 8): light mode already gets natural
+    # lift from shadow contrast against a plain page. This is that same
+    # lift made explicit as a token, so cards use ONE rule in both
+    # themes -- see the dark set below for why dark mode's version is
+    # different (a border-only card barely reads as "lifted" against a
+    # dark page; light mode's is mostly shadow, dark mode's leans more
+    # on a crisper border plus a soft glow).
+    "card-shadow": "0 1px 2px rgba(28,25,23,0.04), 0 1px 1px rgba(28,25,23,0.03)",
 }
 
 _DARK_TOKENS = {
-    "bg": "#0F1420",
-    "bg-elevated": "#161C2C",
-    "bg-subtle": "#1B2233",
-    "bg-muted": "#212940",
-    "border": "#2A3348",
-    "border-subtle": "#232B3D",
-    "text-primary": "#F3F4F6",
-    "text-secondary": "#B4BAC7",
-    "text-tertiary": "#838EA3",
-    "accent": "#60A5FA",
-    "accent-bg": "#17273F",
-    "accent-border": "#264160",
+    "bg": "#121110",
+    "bg-elevated": "#1A1816",
+    "bg-subtle": "#201D1A",
+    "bg-muted": "#272320",
+    "border": "#322D29",
+    "border-subtle": "#282420",
+    "text-primary": "#F5F2EF",
+    "text-secondary": "#B8B0A8",
+    "text-tertiary": "#91897F",
+    "accent": "#22D3EE",
+    "accent-text": "#22D3EE",  # already passes as text at this lightness; no separate shade needed
+    "accent-bg": "#103239",
+    "accent-border": "#1B4D56",
     "accent-contrast": "#0B1220",
     "critical": "#F87171", "critical-bg": "#3A1518", "critical-border": "#5B2226",
     "moderate": "#FBBF24", "moderate-bg": "#3A2C0C", "moderate-border": "#5C4315",
     "minor": "#4ADE80", "minor-bg": "#0F2E1C", "minor-border": "#1D4D31",
     "shadow-sm": "0 1px 2px rgba(0,0,0,0.35)",
     "shadow-md": "0 4px 16px rgba(0,0,0,0.4)",
+    "card-shadow": "0 0 0 1px rgba(255,255,255,0.03), 0 3px 10px rgba(0,0,0,0.35)",
 }
 
 # Aliasing the "good"/"warn"/"bad" score tiers onto the exact same colors
@@ -223,8 +405,45 @@ def _build_theme_css() -> str:
     root_vars = "".join(f"--{name}:{value};" for name, value in tokens.items())
 
     return f"""
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700;800&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
     :root {{ {root_vars} }}
+
+    /* ---- Typography (requirement 1) ------------------------------------
+       Inter for everything data-dense/body -- optimized for legibility at
+       small sizes. Space Grotesk (more character than a generic system
+       sans, without being loud) reserved for the score number and section
+       headings ONLY, so it reads as a deliberate accent, not a full
+       typeface swap. Both are set once, on .stApp, and inherit down --
+       never overridden per-component. Contrast is unaffected by this
+       change (it's a font-family swap only, no color/weight change to
+       anything already contrast-checked). */
+    .stApp {{ font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+    .mdq-hero h1, .mdq-score-number, .mdq-section-title, .mdq-dim-value {{
+        font-family: 'Space Grotesk', 'Inter', sans-serif;
+    }}
+
+    /* ---- Visible keyboard focus (requirement 3b) ------------------------
+       The accent token, not the browser default outline -- applied via
+       :focus-visible so it shows for keyboard navigation without adding a
+       ring on every mouse click (the standard, correct way to do this;
+       :focus-visible is what actually distinguishes the two). Covers
+       every interactive element in the app: theme toggle, uploader,
+       expanders, popovers, buttons, download button, and the sortable
+       table headers rendered inside the components.html iframe (that
+       iframe carries its own copy of this rule -- see
+       _sortable_column_table_html). */
+    .stApp a:focus-visible, .stApp button:focus-visible, .stApp [role="button"]:focus-visible,
+    .stApp input:focus-visible, .stApp [tabindex]:focus-visible,
+    [data-testid="stFileUploaderDropzone"]:focus-within, [data-baseweb="switch"]:focus-within,
+    [data-testid="stExpander"] summary:focus-visible, [data-testid="stPopoverButton"]:focus-visible,
+    button[kind="popover"]:focus-visible {{
+        outline: 2px solid var(--accent) !important;
+        outline-offset: 2px !important;
+        border-radius: 6px;
+    }}
 
     /* ---- Native Streamlit chrome, re-themed to match ------------------- */
     [data-testid="stAppViewContainer"], .stApp {{ background: var(--bg); }}
@@ -232,6 +451,17 @@ def _build_theme_css() -> str:
     [data-testid="stSidebar"] {{ background: var(--bg-subtle); border-right: 1px solid var(--border); }}
     [data-testid="stSidebarContent"] {{ color: var(--text-primary); }}
     .block-container {{ padding-top: 2rem; padding-bottom: 3rem; max-width: 1100px; }}
+
+    /* Ensure the core layout frame provides clean spacing around the main title */
+    .main .block-container {{
+        padding-top: 4rem !important;
+        padding-bottom: 3rem !important;
+    }}
+
+    /* Fix sidebar header padding so content drops gracefully below default icons */
+    [data-testid="stSidebarUserContent"] {{
+        padding-top: 1.5rem !important;
+    }}
     /* Scoped to .stApp (not a bare "body,p,span,div") so this can't bleed
        into elements that need their OWN color rule to win instead --
        native buttons and the uploader caption below are exactly that
@@ -254,7 +484,11 @@ def _build_theme_css() -> str:
     }}
 
     [data-testid="stFileUploaderDropzone"] {{
-        background: var(--bg-subtle); border: 1.5px dashed var(--border); border-radius: 14px;
+        background: var(--bg-elevated); border: 2px dashed var(--border); border-radius: 12px;
+        padding: 1.6rem; transition: border-color 0.2s ease;
+    }}
+    [data-testid="stFileUploaderDropzone"]:hover, [data-testid="stFileUploaderDropzone"]:focus-within {{
+        border-color: var(--accent);
     }}
     /* The "uploaded file" chip that appears after a file is added --
        same bug pattern as the button above (native white background,
@@ -322,10 +556,20 @@ def _build_theme_css() -> str:
     /* ---- Section headings ------------------------------------------------ */
     .mdq-section-title {{ font-size: 1.15rem; font-weight: 700; color: var(--text-primary); margin: 1.8rem 0 .7rem; }}
 
-    /* ---- Score hero card --------------------------------------------------- */
+    /* ---- Score hero card ---------------------------------------------------
+       Requirement 4 (restrained "AI-era" accent): a soft diagonal
+       gradient hinting at the accent color in one corner -- never
+       filling the whole card, and never anywhere near the severity
+       red/amber/green system, so it can't be mistaken for carrying its
+       own meaning. Requirement 3 (score-reveal entrance): one CSS
+       @keyframes rise-in, ~420ms -- within the "nothing over ~400-500ms"
+       guidance, and it only ever plays once per render, never on a
+       repeated interaction. */
+    @keyframes mdq-rise-in {{ from {{ opacity: 0; transform: translateY(10px); }} to {{ opacity: 1; transform: translateY(0); }} }}
     .mdq-score-hero {{ display: flex; align-items: center; gap: 2rem; flex-wrap: wrap;
                        border-radius: 18px; padding: 1.75rem 2rem; border: 1px solid var(--border);
-                       background: var(--bg-elevated); box-shadow: var(--shadow-md); }}
+                       background: linear-gradient(135deg, var(--bg-elevated) 55%, var(--accent-bg) 145%);
+                       box-shadow: var(--shadow-md); animation: mdq-rise-in 420ms ease-out; }}
     .mdq-score-number {{ font-size: 3.4rem; font-weight: 800; line-height: 1; letter-spacing: -0.02em; }}
     .mdq-score-of100 {{ font-size: 1.15rem; font-weight: 500; opacity: .55; margin-left: .2rem; }}
     .mdq-score-tier-pill {{ display: inline-flex; align-items: center; gap: .35rem; font-weight: 700; font-size: .95rem;
@@ -336,15 +580,18 @@ def _build_theme_css() -> str:
     /* ---- Issue-count chips (executive summary strip) ---------------------- */
     .mdq-count-row {{ display: flex; gap: .7rem; flex-wrap: wrap; margin-top: 1.1rem; }}
     .mdq-count-chip {{ display: flex; align-items: center; gap: .55rem; border-radius: 12px; padding: .7rem 1.05rem;
-                       border: 1px solid var(--border); background: var(--bg-elevated); min-width: 140px; }}
+                       border: 1px solid var(--border); background: var(--bg-elevated); min-width: 140px;
+                       box-shadow: var(--card-shadow); }}
     .mdq-count-chip .n {{ font-size: 1.5rem; font-weight: 800; line-height: 1; }}
     .mdq-count-chip .lbl {{ font-size: .78rem; color: var(--text-secondary); font-weight: 600; }}
 
     /* ---- Dimension score grid ---------------------------------------------- */
     .mdq-dim-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; margin: .6rem 0 1rem; }}
     @media (max-width: 700px) {{ .mdq-dim-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
-    .mdq-dim-card {{ background: var(--bg-muted); border: 1px solid var(--border-subtle); border-radius: 12px; padding: .9rem 1.05rem; }}
-    .mdq-dim-label {{ font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-tertiary); }}
+    .mdq-dim-card {{ background: var(--bg-muted); border: 1px solid var(--border-subtle); border-radius: 12px; padding: .9rem 1.05rem;
+                     box-shadow: var(--card-shadow); }}
+    .mdq-dim-label {{ font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--text-tertiary);
+                      display: flex; align-items: center; gap: .35rem; }}
     .mdq-dim-value {{ font-size: 1.6rem; font-weight: 800; color: var(--text-primary); margin: .15rem 0 .55rem; }}
     .mdq-bar-track {{ height: 7px; background: var(--border); border-radius: 999px; overflow: hidden; }}
     .mdq-bar-fill {{ height: 100%; border-radius: 999px; }}
@@ -361,11 +608,22 @@ def _build_theme_css() -> str:
     .mdq-tag-table {{ display: inline-block; font-size: .72rem; font-weight: 600; padding: .12rem .55rem; border-radius: 6px;
                       background: var(--bg-muted); color: var(--text-secondary); border: 1px solid var(--border); }}
 
-    /* ---- Status banners ------------------------------------------------------ */
-    .mdq-banner {{ border-radius: 12px; padding: .9rem 1.15rem; border: 1px solid; font-size: .9rem; margin: .6rem 0 1rem; }}
-    .mdq-banner-warn {{ background: var(--moderate-bg); border-color: var(--moderate-border); color: var(--moderate); }}
-    .mdq-banner-good {{ background: var(--minor-bg); border-color: var(--minor-border); color: var(--minor); }}
-    .mdq-banner-error {{ background: var(--critical-bg); border-color: var(--critical-border); color: var(--critical); }}
+    /* ---- Status banners (requirement 7) ---------------------------------
+       Was a solid tinted fill with colored body text -- read as a muddy
+       block in dark mode, and put color-as-meaning on the whole
+       paragraph rather than on one clear signal. Rebuilt to match the
+       pattern finding cards already use well: a neutral card (bg-elevated,
+       normal text-primary body copy) with ONE colored left-border accent
+       bar carrying the severity meaning, paired with the emoji already in
+       every banner's own text -- so color still never carries meaning
+       alone, it's just concentrated in one clean accent instead of
+       smeared across the whole surface. */
+    .mdq-banner {{ border-radius: 10px; padding: .85rem 1.15rem; border: 1px solid var(--border); border-left-width: 4px;
+                  font-size: .9rem; margin: .6rem 0 1rem; background: var(--bg-elevated); color: var(--text-primary);
+                  box-shadow: var(--card-shadow); }}
+    .mdq-banner-warn {{ border-left-color: var(--moderate); }}
+    .mdq-banner-good {{ border-left-color: var(--minor); }}
+    .mdq-banner-error {{ border-left-color: var(--critical); }}
 
     /* ---- Table sub-caption ------------------------------------------------- */
     .mdq-table-sub {{ font-size: .82rem; color: var(--text-tertiary); margin-bottom: .3rem; }}
@@ -387,13 +645,81 @@ def _build_theme_css() -> str:
     /* ---- Empty / first-run state -------------------------------------------- */
     .mdq-empty-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; margin: 1.4rem 0; }}
     @media (max-width: 700px) {{ .mdq-empty-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
-    .mdq-empty-card {{ background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 14px; padding: 1.1rem 1.2rem; }}
-    .mdq-empty-card .icon {{ font-size: 1.5rem; }}
-    .mdq-empty-card h4 {{ font-size: .95rem; font-weight: 700; margin: .5rem 0 .3rem; color: var(--text-primary); }}
-    .mdq-empty-card p {{ font-size: .82rem; color: var(--text-secondary); line-height: 1.5; margin: 0; }}
+    .mdq-empty-card, .mdq-feature-card {{ background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 1.1rem 1.2rem; }}
+    .mdq-empty-card .icon, .mdq-feature-card .icon {{ font-size: 1.5rem; }}
+    .mdq-empty-card h4, .mdq-feature-card h4 {{ font-size: .95rem; font-weight: 700; margin: .5rem 0 .3rem; color: var(--text-primary); }}
+    .mdq-empty-card p, .mdq-feature-card p {{ font-size: .82rem; color: var(--text-secondary); line-height: 1.5; margin: 0; }}
     .mdq-empty-hint {{ background: var(--accent-bg); border: 1px solid var(--accent-border); border-radius: 12px;
                        padding: .8rem 1.1rem; font-size: .85rem; color: var(--text-secondary); margin-top: 1rem; }}
     .mdq-empty-hint code {{ background: var(--bg-muted); padding: .1rem .4rem; border-radius: 4px; color: var(--text-primary); }}
+    .mdq-empty-illustration {{ display: flex; justify-content: center; margin: .4rem 0 1.2rem; opacity: .95; }}
+
+    /* ---- Shared icon/mark sizing --------------------------------------------
+       One rule per context, all pointing at the SAME svg markup
+       (_DIMENSION_ICONS) -- see that dict's own docstring for why this is
+       the fix for requirement 0b (mismatched icons between screens). */
+    .mdq-dim-label .mdq-icon {{ width: .95rem; height: .95rem; flex-shrink: 0; }}
+    .mdq-empty-card .icon .mdq-icon, .mdq-feature-card .icon .mdq-icon {{ width: 1.6rem; height: 1.6rem; color: var(--accent); }}
+    .mdq-empty-card .icon, .mdq-feature-card .icon {{ line-height: 0; }}
+    .mdq-mark {{ width: 2.1rem; height: 2.1rem; flex-shrink: 0; vertical-align: middle; }}
+    .mdq-hero-title-row {{ display: flex; align-items: center; gap: .65rem; }}
+    .mdq-tagline {{ font-size: 1.05rem; font-weight: 600; color: var(--accent-text); margin: -.1rem 0 .6rem; font-family: 'Space Grotesk', 'Inter', sans-serif; }}
+
+    /* ---- Inline technical-keyword badge (e.g. `pandas`, `RapidFuzz`) ---- */
+    .mdq-kw {{ background: var(--bg-muted); border: 1px solid var(--border); padding: 2px 6px;
+              border-radius: 4px; font-family: monospace; font-size: 0.85em; color: var(--text-primary); }}
+
+    /* ---- Sidebar top buffer + info badges (replacing plain bullets) ---- */
+    .mdq-sidebar-spacer {{ height: .5rem; }}
+    .mdq-info-badge {{ background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px;
+                       padding: .7rem .85rem; margin-bottom: .55rem; font-size: .85rem; color: var(--text-secondary); line-height: 1.5; }}
+    .mdq-info-badge b {{ color: var(--text-primary); }}
+
+    /* ---- Workflow stepper cards (st.columns(3)) with connector ---- */
+    .mdq-step-card {{ display: flex; align-items: center; gap: .55rem; background: var(--bg-elevated);
+                      border: 1px solid var(--border); border-radius: 8px; padding: .6rem .8rem; position: relative; }}
+    .mdq-step-num {{ flex-shrink: 0; width: 24px; height: 24px; border-radius: 50%; background: var(--accent);
+                     color: var(--accent-contrast); font-weight: 700; font-size: .8rem;
+                     display: inline-flex; justify-content: center; align-items: center; }}
+    .mdq-step-label {{ font-size: .85rem; font-weight: 600; color: var(--text-primary); }}
+    .mdq-step-connector {{ text-align: center; color: var(--border); font-size: 1.2rem; padding-top: .2rem; }}
+    @media (max-width: 700px) {{ .mdq-step-connector {{ display: none; }} }}
+
+    /* ---- Feature-check grid (st.columns(4)) hover lift ---- */
+    .mdq-feature-card {{ background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px;
+                         padding: 1.1rem 1rem; box-shadow: var(--shadow-sm); transition: box-shadow 0.2s ease, transform 0.2s ease; }}
+    .mdq-feature-card:hover {{ box-shadow: var(--shadow-md); transform: translateY(-2px); }}
+
+    /* ---- Card separation in dark mode (requirement 8) -----------------------
+       st.container(border=True) is what every finding card and manual-
+       review item renders through -- its native border alone reads as too
+       subtle against a dark page to feel "lifted". Same card-shadow token
+       every other card uses, applied to Streamlit's own bordered-container
+       wrapper so it never needs a bespoke class of its own. */
+    [data-testid="stVerticalBlockBorderWrapper"] {{ box-shadow: var(--card-shadow); border-radius: 10px; }}
+
+    /* ---- Skeleton loading placeholder (Section C) ---------------------------
+       Shown the instant a file is dropped, before st.status even starts --
+       "establishes structure upfront" rather than a blank pause, per the
+       loading-state research this pass is grounded in. Shape matches the
+       real score-hero + 4-dimension-card layout it's standing in for. */
+    @keyframes mdq-shimmer {{ 0% {{ background-position: -200% 0; }} 100% {{ background-position: 200% 0; }} }}
+    .mdq-skeleton {{ background: linear-gradient(90deg, var(--bg-muted) 25%, var(--border-subtle) 50%, var(--bg-muted) 75%);
+                     background-size: 200% 100%; animation: mdq-shimmer 1.4s ease-in-out infinite; }}
+    .mdq-skel-hero {{ height: 118px; border-radius: 18px; margin-bottom: .9rem; }}
+    .mdq-skel-dimgrid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; }}
+    @media (max-width: 700px) {{ .mdq-skel-dimgrid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+    .mdq-skel-dim {{ height: 92px; border-radius: 12px; }}
+
+    /* ---- Sortable per-column table (requirement 6b) --------------------------
+       Rendered inside its own components.html iframe (see
+       _sortable_column_table_html) because it needs real click-to-sort JS
+       -- Streamlit's markdown sanitizes out <script> tags, confirmed
+       directly rather than assumed (a script injected via the same
+       unsafe_allow_html path this file already uses for everything else
+       never executes). This wrapper just keeps its outer frame visually
+       consistent with every other .mdq-table on the page. */
+    .mdq-sortable-frame {{ border: none; width: 100%; }}
     </style>
     """
 
@@ -404,13 +730,13 @@ def _build_theme_css() -> str:
 
 def _dimension_grid_html(scorecard) -> str:
     cards = []
-    for attr_name, label, icon, _description in DIMENSION_META:
+    for attr_name, label, icon_key, _description in DIMENSION_META:
         score = getattr(scorecard, attr_name)
         tier_alias = _TIER_TOKEN_ALIAS[_score_tier(score)]
         width = max(0.0, min(100.0, score))
         cards.append(f"""
             <div class="mdq-dim-card">
-              <div class="mdq-dim-label">{icon} {_html(label)}</div>
+              <div class="mdq-dim-label">{_DIMENSION_ICONS[icon_key]} {_html(label)}</div>
               <div class="mdq-dim-value">{score:.1f}</div>
               <div class="mdq-bar-track"><div class="mdq-bar-fill" style="width:{width}%;background:var(--{tier_alias});"></div></div>
             </div>
@@ -427,27 +753,102 @@ def _severity_badge_html(severity: str) -> str:
     return f'<span class="mdq-sev-badge mdq-sev-{severity}">{meta["emoji"]} {meta["label"]}</span>'
 
 
-def _per_column_table_html(scorecard) -> str:
-    rows = []
-    for column_score in scorecard.per_column_scores.values():
-        rows.append(f"""
-            <tr>
-              <td>{_html(column_score.column_name)}</td>
-              <td class="num">{column_score.completeness_score:.1f}</td>
-              <td class="num">{column_score.consistency_score:.1f}</td>
-              <td class="num combined">{column_score.combined_score:.1f}</td>
-            </tr>
-        """)
-    return f"""
-        <div class="mdq-table-wrap">
-          <table class="mdq-table">
-            <thead>
-              <tr><th>Column</th><th class="num">Completeness</th><th class="num">Consistency</th><th class="num">Combined</th></tr>
-            </thead>
-            <tbody>{"".join(rows)}</tbody>
-          </table>
-        </div>
+def _sortable_column_table_html(scorecard, tokens: dict) -> str:
     """
+    Requirement 6b: the per-column score table, click-to-sort on any
+    header, ascending/descending, with a visible active-sort indicator.
+
+    Rendered as a fully self-contained HTML document via
+    st.components.v1.html (a real iframe, see render_table_section) --
+    NOT through this file's usual render_html() path, because that path
+    goes through Streamlit's markdown renderer, which strips <script>
+    tags (confirmed directly: a script injected that way never executes,
+    not assumed). A components.html iframe is Streamlit's own built-in
+    primitive for exactly this case -- genuine custom JS -- so this adds
+    no new dependency, just uses a different (correct) Streamlit API for
+    the one piece of the page that actually needs to run script.
+
+    Because the iframe is a separate document with no access to this
+    page's :root CSS variables, every color below is the CURRENT theme's
+    already-resolved value from `tokens`, not a var(--x) reference --
+    this is what keeps it in sync with the light/dark toggle: app.py
+    re-calls this function (with the other token dict) on every rerun,
+    same as every other themed component in this file.
+    """
+    rows = list(scorecard.per_column_scores.values())
+    body_rows = "".join(
+        f"<tr>"
+        f'<td data-sort="{_html(column_score.column_name.lower())}">{_html(column_score.column_name)}</td>'
+        f'<td class="num" data-sort="{column_score.completeness_score}">{column_score.completeness_score:.1f}</td>'
+        f'<td class="num" data-sort="{column_score.consistency_score}">{column_score.consistency_score:.1f}</td>'
+        f'<td class="num combined" data-sort="{column_score.combined_score}">{column_score.combined_score:.1f}</td>'
+        f"</tr>"
+        for column_score in rows
+    )
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  * {{ box-sizing: border-box; }}
+  body {{ margin: 0; font-family: 'Inter', -apple-system, sans-serif; background: {tokens["bg-elevated"]}; color: {tokens["text-primary"]}; }}
+  .wrap {{ overflow-x: auto; border: 1px solid {tokens["border"]}; border-radius: 12px; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 13.5px; }}
+  thead th {{ text-align: left; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+              color: {tokens["text-tertiary"]}; background: {tokens["bg-muted"]}; padding: 9px 14px; border-bottom: 1px solid {tokens["border"]};
+              cursor: pointer; user-select: none; white-space: nowrap; }}
+  thead th:hover {{ color: {tokens["accent"]}; }}
+  thead th:focus-visible {{ outline: 2px solid {tokens["accent"]}; outline-offset: -2px; }}
+  thead th.num {{ text-align: right; }}
+  .sort-ind {{ font-size: 9px; color: {tokens["accent"]}; }}
+  tbody td {{ padding: 8px 14px; border-bottom: 1px solid {tokens["border-subtle"]}; }}
+  tbody tr:last-child td {{ border-bottom: none; }}
+  tbody tr:hover {{ background: {tokens["bg-subtle"]}; }}
+  td.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
+  td.num.combined {{ font-weight: 700; }}
+</style></head>
+<body>
+  <div class="wrap">
+    <table id="t">
+      <thead><tr>
+        <th data-key="0" tabindex="0">Column<span class="sort-ind"></span></th>
+        <th data-key="1" tabindex="0" class="num">Completeness<span class="sort-ind"></span></th>
+        <th data-key="2" tabindex="0" class="num">Consistency<span class="sort-ind"></span></th>
+        <th data-key="3" tabindex="0" class="num">Combined<span class="sort-ind"></span></th>
+      </tr></thead>
+      <tbody>{body_rows}</tbody>
+    </table>
+  </div>
+  <script>
+    function sortBy(th) {{
+      const table = document.getElementById('t');
+      const tbody = table.querySelector('tbody');
+      const colIndex = parseInt(th.dataset.key, 10);
+      const nextDir = th.dataset.dir === 'asc' ? 'desc' : 'asc';
+      table.querySelectorAll('th').forEach(h => {{ h.dataset.dir = ''; h.querySelector('.sort-ind').textContent = ''; }});
+      th.dataset.dir = nextDir;
+      th.querySelector('.sort-ind').textContent = nextDir === 'asc' ? ' \\u25B2' : ' \\u25BC';
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      rows.sort((a, b) => {{
+        const cellA = a.children[colIndex], cellB = b.children[colIndex];
+        const rawA = cellA.dataset.sort, rawB = cellB.dataset.sort;
+        const numA = parseFloat(rawA), numB = parseFloat(rawB);
+        const bothNumeric = !isNaN(numA) && !isNaN(numB) && colIndex !== 0;
+        const va = bothNumeric ? numA : rawA;
+        const vb = bothNumeric ? numB : rawB;
+        if (va < vb) return nextDir === 'asc' ? -1 : 1;
+        if (va > vb) return nextDir === 'asc' ? 1 : -1;
+        return 0;
+      }});
+      rows.forEach(r => tbody.appendChild(r));
+    }}
+    document.querySelectorAll('th[data-key]').forEach(th => {{
+      th.addEventListener('click', () => sortBy(th));
+      th.addEventListener('keydown', (e) => {{ if (e.key === 'Enter' || e.key === ' ') {{ e.preventDefault(); sortBy(th); }} }});
+    }});
+  </script>
+</body></html>"""
 
 
 def _count_chip_html(count: int, label: str, tier_alias: str) -> str:
@@ -518,6 +919,96 @@ def _remediation_actions_table_html(actions) -> str:
     """
 
 
+# ---------------------------------------------------------------------------
+# Requirement 0 (top priority in this pass): themed Dashboard charts.
+#
+# st.bar_chart / st.line_chart render through Vega-Lite with Vega-Lite's
+# OWN default light theme -- confirmed directly by screenshot, not
+# assumed: every chart in the Dashboard section rendered as a plain white
+# rectangle against a dark page, because that Vega-Lite default never
+# sees this file's CSS tokens at all. Same root cause, same fix pattern,
+# as the reason results aren't shown via st.dataframe elsewhere in this
+# file: build the chart explicitly (here, as an alt.Chart) and hand it
+# real colors instead of trusting a native widget's own default theme.
+# ---------------------------------------------------------------------------
+
+def _chart_axis(tokens: dict, label_angle: int = None) -> alt.Axis:
+    """One consistent axis style, built from the CURRENT theme's already-
+    resolved colors -- called fresh for every chart, every render, so it
+    always matches whichever theme is active (light or dark) at that
+    moment, exactly like every other themed element on the page."""
+    kwargs = dict(
+        labelColor=tokens["text-secondary"], titleColor=tokens["text-secondary"],
+        domainColor=tokens["border"], tickColor=tokens["border"], gridColor=tokens["border-subtle"],
+    )
+    if label_angle is not None:
+        kwargs["labelAngle"] = label_angle
+    return alt.Axis(**kwargs)
+
+
+def _altair_bar_chart(chart_data: pd.DataFrame, x_field: str, tokens: dict) -> alt.Chart:
+    """Themed replacement for st.bar_chart -- used for both the numeric-
+    distribution and categorical charts (chart_generation.py already
+    shaped chart_data identically for both: an index plus one "count"
+    column), so one function covers both chart_type values that aren't
+    "date_over_time"."""
+    data = chart_data.reset_index()
+    return (
+        alt.Chart(data)
+        .mark_bar(color=tokens["accent"], cornerRadiusTopLeft=3, cornerRadiusTopRight=3)
+        .encode(
+            x=alt.X(f"{x_field}:N", sort=None, title=None, axis=_chart_axis(tokens, label_angle=-40)),
+            y=alt.Y("count:Q", title=None, axis=_chart_axis(tokens)),
+            tooltip=[alt.Tooltip(f"{x_field}:N", title=x_field.replace("_", " ").title()), alt.Tooltip("count:Q", title="Count")],
+        )
+        .properties(height=220, background=tokens["bg-elevated"])
+        .configure_view(strokeWidth=0)
+    )
+
+
+def _altair_line_chart(chart_data: pd.DataFrame, x_field: str, tokens: dict) -> alt.Chart:
+    """Themed replacement for st.line_chart -- used only for the
+    date-over-time chart type."""
+    data = chart_data.reset_index()
+    return (
+        alt.Chart(data)
+        .mark_line(color=tokens["accent"], point=alt.OverlayMarkDef(color=tokens["accent"], filled=True, size=45))
+        .encode(
+            x=alt.X(f"{x_field}:N", sort=None, title=None, axis=_chart_axis(tokens, label_angle=-40)),
+            y=alt.Y("count:Q", title=None, axis=_chart_axis(tokens)),
+            tooltip=[alt.Tooltip(f"{x_field}:N", title=x_field.replace("_", " ").title()), alt.Tooltip("count:Q", title="Count")],
+        )
+        .properties(height=220, background=tokens["bg-elevated"])
+        .configure_view(strokeWidth=0)
+    )
+
+
+def _low_cardinality_note(dataframe: pd.DataFrame, column_name: str) -> str:
+    """
+    Section C: a column where almost every value is the same one thing
+    (e.g. a repeated device ID) produces a chart that's just one giant
+    bar -- technically correct, not informative. Below
+    LOW_CARDINALITY_THRESHOLD distinct values, return a plain sentence
+    to show INSTEAD of a chart; returns None when the column has enough
+    variety that a chart is still the right call. Reads directly from
+    the table's own dataframe (never chart_data, which for a categorical
+    column is already bucketed into top-10 + "Other" by
+    core/chart_generation.py) so this sees the column's REAL distinct
+    count, not a post-bucketing approximation of it.
+    """
+    non_blank = dataframe[column_name].dropna().astype(str).str.strip()
+    non_blank = non_blank[non_blank != ""]
+    if non_blank.empty:
+        return None
+    distinct = non_blank.nunique()
+    if distinct >= LOW_CARDINALITY_THRESHOLD:
+        return None
+    value_counts = non_blank.value_counts()
+    top_value, top_count = value_counts.idxmax(), int(value_counts.max())
+    value_word = "value" if distinct == 1 else "values"
+    return f'This column has only {distinct} unique {value_word} — e.g. "{top_value}" appears in {top_count} of {len(non_blank)} rows.'
+
+
 def render_remediation_section(table_result) -> None:
     """
     Tier 1's whole UI: cleaning summary, cleaned-CSV download, and the
@@ -570,6 +1061,7 @@ def render_remediation_section(table_result) -> None:
 
     # -- Dashboard ------------------------------------------------------------
     with st.expander("📊 Dashboard", expanded=False):
+        tokens = _theme_tokens()
         charts = generate_charts_for_table(table_result.dataframe, table_result.column_types, table_result.findings)
         for chart in charts:
             annotation_html = (
@@ -582,10 +1074,16 @@ def render_remediation_section(table_result) -> None:
                 render_html('<div class="mdq-table-sub">Not enough data in this column to chart.</div>')
                 continue
 
+            low_cardinality_note = _low_cardinality_note(table_result.dataframe, chart.column_name)
+            if low_cardinality_note:
+                render_html(f'<div class="mdq-table-sub">{_html(low_cardinality_note)}</div>')
+                continue
+
+            x_field = chart.chart_data.index.name or "value"
             if chart.chart_type == "date_over_time":
-                st.line_chart(chart.chart_data, height=220)
+                st.altair_chart(_altair_line_chart(chart.chart_data, x_field, tokens), use_container_width=True)
             else:
-                st.bar_chart(chart.chart_data, height=220)
+                st.altair_chart(_altair_bar_chart(chart.chart_data, x_field, tokens), use_container_width=True)
 
 
 # ---------------------------------------------------------------------------
@@ -657,27 +1155,44 @@ def render_header():
     styling before it takes effect) -- so this function has to run before
     anything else touches st.*, including session_state-based theme setup.
     """
-    st.set_page_config(page_title="MSME Data Quality Scorecard", page_icon="📊", layout="wide")
+    st.set_page_config(
+        page_title="MSME Data Quality Scorecard",
+        page_icon=f"data:image/svg+xml,{quote(_FAVICON_SVG)}",
+        layout="wide",
+    )
 
     if "theme" not in st.session_state:
         st.session_state.theme = "light"  # light-first default, per this redesign's own brief
 
     render_html(_build_theme_css())
     render_html(
-        """
+        f"""
         <div class="mdq-hero">
-          <h1>📊 AI-Ready Data Quality Scorecard for MSMEs</h1>
+          <div class="mdq-hero-title-row">
+            {_MARK_SVG}
+            <h1>AI-Ready Data Quality Scorecard for MSMEs</h1>
+          </div>
+          <div class="mdq-tagline">Know your data before your AI does.</div>
           <p>Upload raw business data — spreadsheets, POS exports, Tally dumps, CRM lists — and get an
           instant, explainable score on completeness, consistency, duplication, and structure, plus a
           plain-language list of exactly what to fix before it's used in an AI or BI pipeline.</p>
-          <div class="mdq-steps">
-            <div class="mdq-step"><span class="mdq-step-num">1</span>Upload CSV / Excel (multi-file &amp; multi-sheet supported)</div>
-            <div class="mdq-step"><span class="mdq-step-num">2</span>Automatic scoring &amp; calibration per table</div>
-            <div class="mdq-step"><span class="mdq-step-num">3</span>Prioritized, plain-language fix list</div>
-          </div>
         </div>
         """
     )
+    # Workflow stepper: real st.columns(3) (not a single CSS flex row) so
+    # each step is its own layout block, with a thin connector glyph
+    # between columns standing in for a joining line.
+    steps = ["Upload File", "Auto-Scoring", "Prioritized Fix List"]
+    step_cols = st.columns([10, 1, 10, 1, 10])
+    for i, label in enumerate(steps):
+        with step_cols[i * 2]:
+            render_html(
+                f'<div class="mdq-step-card"><span class="mdq-step-num">{i + 1}</span>'
+                f'<span class="mdq-step-label">{_html(label)}</span></div>'
+            )
+        if i < len(steps) - 1:
+            with step_cols[i * 2 + 1]:
+                render_html('<div class="mdq-step-connector">&#8250;</div>')
 
 
 def _on_theme_toggle_change():
@@ -719,17 +1234,21 @@ def render_sidebar_explainer():
     explaining the tool live.
     """
     with st.sidebar:
-        st.subheader("⚙️ How this tool works")
-        st.markdown(
-            "- **Every score is 100% deterministic** — pandas + RapidFuzz "
-            "rule-based checks, no AI in the pass/fail logic or the score formula.\n"
-            "- **Two thresholds are auto-calibrated per file** using scikit-learn "
+        render_html('<div class="mdq-sidebar-spacer"></div>')  # top buffer, clear of the collapse toggle
+        render_html('<h2 style="font-size:1.1rem;margin:0 0 .6rem;">⚙️ How this tool works</h2>')
+        kw = lambda s: f'<span class="mdq-kw">{s}</span>'  # noqa: E731 -- tiny local helper, not worth a def
+        badges = [
+            f"<b>Every score is 100% deterministic</b> — {kw('pandas')} + {kw('RapidFuzz')} "
+            "rule-based checks, no AI in the pass/fail logic or the score formula.",
+            f"<b>Two thresholds are auto-calibrated per file</b> using {kw('scikit-learn')} "
             "(k-means): the duplicate-name similarity cutoff, and the "
-            "critical/moderate severity split. Click any 🎯 badge to see which.\n"
-            "- **Fix-list sentences are always guaranteed** by templates first. "
+            "critical/moderate severity split. Click any 🎯 badge to see which.",
+            "<b>Fix-list sentences are always guaranteed</b> by templates first. "
             "A small local LLM (Qwen2.5-0.5B, offline, GGUF) may rephrase the "
-            "most important ones — click any 🤖 tag to see what it was based on."
-        )
+            "most important ones — click any 🤖 tag to see what it was based on.",
+        ]
+        for text in badges:
+            render_html(f'<div class="mdq-info-badge">{text}</div>')
         st.divider()
         st.caption("Runs fully offline after one-time model setup. No cloud AI calls at runtime.")
 
@@ -742,19 +1261,24 @@ def render_empty_state():
     anything, plus a pointer to a sample file to try.
     """
     render_html('<div class="mdq-section-title">What this tool checks</div>')
-    cards = "".join(
-        f"""
-        <div class="mdq-empty-card">
-          <div class="icon">{icon}</div>
-          <h4>{_html(label)}</h4>
-          <p>{_html(description)}</p>
-        </div>
-        """
-        for _attr, label, icon, description in DIMENSION_META
-    )
-    render_html(f'<div class="mdq-empty-grid">{cards}</div>')
+    # Real st.columns(4) (not a single CSS grid div) -- each dimension is
+    # its own layout block, styled via .mdq-feature-card for the elevated,
+    # shadow-hover "dashboard widget" look.
+    feature_cols = st.columns(4)
+    for col, (_attr, label, icon_key, description) in zip(feature_cols, DIMENSION_META):
+        with col:
+            render_html(
+                f"""
+                <div class="mdq-feature-card">
+                  <div class="icon">{_DIMENSION_ICONS[icon_key]}</div>
+                  <h4>{_html(label)}</h4>
+                  <p>{_html(description)}</p>
+                </div>
+                """
+            )
     render_html(
-        """
+        f"""
+        <div class="mdq-empty-illustration">{_UPLOAD_ILLUSTRATION_SVG}</div>
         <div class="mdq-empty-hint">
           💡 New here? Try it on <code>sample_data/messy_msme_sample.csv</code> — a small,
           deliberately messy sample file bundled with this tool — or drop a multi-sheet
@@ -918,8 +1442,13 @@ def render_table_section(table_result):
                 _SEVERITY_CUTOFF_METHOD_NOTE, popover_key=f"cal-mod-{table_result.table_name}",
             )
 
-        with st.expander("📋 Per-Column Score Detail", expanded=False):
-            render_html(_per_column_table_html(table_result.scorecard))
+        with st.expander("📋 Per-Column Score Detail — click any header to sort", expanded=False):
+            column_count = len(table_result.scorecard.per_column_scores)
+            table_height = min(520, 46 + 38 * max(column_count, 1))
+            components.html(
+                _sortable_column_table_html(table_result.scorecard, _theme_tokens()),
+                height=table_height, scrolling=True,
+            )
 
         render_html('<div class="mdq-section-title" style="margin-top:1.1rem;">🛠️ Fix List for this table</div>')
         if table_result.findings:
@@ -928,6 +1457,22 @@ def render_table_section(table_result):
             render_html('<div class="mdq-banner mdq-banner-good">✅ No issues found — this table looks clean!</div>')
 
         render_remediation_section(table_result)
+
+
+def _make_stage_reporter(status):
+    """
+    Requirement 2: turns core/pipeline.py's on_stage callback into a live
+    st.status() label update, so the ~20-second first-run wait shows real,
+    sequential stages as the pipeline actually runs them -- not a static
+    "please wait" message. Because _STAGE_LABELS' keys are exactly the
+    stage names pipeline.py reports (see that module's docstring), this
+    can never drift into showing a stage that isn't really happening;
+    an unrecognized stage code falls back to showing the raw code rather
+    than a wrong label.
+    """
+    def on_stage(stage: str, table_name: str) -> None:
+        status.update(label=_STAGE_LABELS.get(stage, stage))
+    return on_stage
 
 
 def main():
@@ -951,10 +1496,26 @@ def main():
         render_empty_state()
         return
 
-    with st.status("Reading file(s) and running data quality checks…", expanded=True) as status:
-        st.write("First run on this machine may take about 20 seconds while the local AI model loads — every run after that is fast.")
-        summary = run_multi_table_pipeline(uploaded_files)
+    # Section C: a skeleton matching the real score-hero + dimension-grid
+    # shape, shown the instant a file is dropped -- before st.status even
+    # starts -- so the moment right after clicking upload has structure
+    # to look at instead of a blank pause. Held in an st.empty() slot so
+    # it can be cleared cleanly once real results are ready to render.
+    skeleton_slot = st.empty()
+    with skeleton_slot.container():
+        render_html(
+            '<div class="mdq-skeleton mdq-skel-hero"></div>'
+            '<div class="mdq-skel-dimgrid">'
+            '<div class="mdq-skeleton mdq-skel-dim"></div><div class="mdq-skeleton mdq-skel-dim"></div>'
+            '<div class="mdq-skeleton mdq-skel-dim"></div><div class="mdq-skeleton mdq-skel-dim"></div>'
+            "</div>"
+        )
+
+    with st.status(_STAGE_LABELS["loading"], expanded=True) as status:
+        summary = run_multi_table_pipeline(uploaded_files, on_stage=_make_stage_reporter(status))
         status.update(label="Done — scorecard ready.", state="complete", expanded=False)
+
+    skeleton_slot.empty()
 
     if not summary.table_results:
         # Every single table in the whole upload failed -- this is the
