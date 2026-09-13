@@ -36,6 +36,7 @@ remains exactly what the UI shows -- see core/llm_phrasing.py's docstring
 for the full fallback story.
 """
 
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -61,15 +62,127 @@ from templates.fix_templates import FIX_TEMPLATES
 # Sort order used when displaying the final list -- critical issues first.
 SEVERITY_ORDER = {SEVERITY_CRITICAL: 0, SEVERITY_MODERATE: 1, SEVERITY_MINOR: 2}
 
+# ---------------------------------------------------------------------------
+# Severity calibration is NOT purely "% of rows affected" -- that alone
+# inverts real-world severity (see the two policies below). A free-text
+# column that is 100% empty is the single highest percentage a table can
+# produce, so a pure percentage-driven cutoff makes it look like the
+# worst problem in the file; meanwhile a handful of "TBD"/"unknown"
+# strings sitting in a numeric Age column, or one row with Age=-5, might
+# affect only 3% of rows yet represent a much more concrete, damaging
+# problem. These two small policy layers correct that, on top of (not
+# instead of) the existing per-table percentage calibration:
+#
+#   1. severity_cap -- an issue_type/column combination that is known to
+#      be low-stakes even at 100% (an optional free-text column being
+#      empty) is capped at that ceiling, and its percentage is excluded
+#      from the pool calibrate_severity_thresholds() sees, so it can't
+#      drag the "critical" cutoff up so high that a real problem
+#      elsewhere in the table gets under-classified as a side effect.
+#   2. severity_floor -- an issue_type that is inherently a strong signal
+#      regardless of how many rows it touches (an exact duplicate row, a
+#      literal "unknown" sitting in a numeric column, a domain-impossible
+#      value like Age=-5) is never allowed to fall below a floor, even if
+#      its percentage alone would classify it as minor.
+# ---------------------------------------------------------------------------
+
+# Column-name substrings (lowercased) for free-text columns whose entire
+# purpose is optional commentary -- a human filling in "why", not core
+# transactional data. Empty is the NORMAL state for these, not a defect.
+_OPTIONAL_FREE_TEXT_NAME_HINTS = (
+    "notes", "note", "comment", "comments", "remark", "remarks",
+    "description", "additional_info", "additional_information", "feedback", "memo",
+)
+
+# If any of these appear in the column name, the column is explicitly
+# calling itself out as required -- e.g. "Mandatory_Notes",
+# "Required_Comment" -- so the optional-free-text cap above must NOT
+# apply, even though the name also matches one of the hints above.
+_MANDATORY_OVERRIDE_HINTS = ("mandatory", "required", "compulsory", "must_")
+
+
+def _is_optional_free_text_column(column_name: str, column_type: Optional[str]) -> bool:
+    """
+    True only for a genuinely optional, free-text commentary column --
+    see the two hint lists above. column_type is checked (when known)
+    because this rule is specifically about free TEXT commentary fields;
+    a numeric or date column matching one of these words by coincidence
+    would be a different (and real) problem, not optional commentary.
+
+    "unknown" is accepted alongside "text" (not just None) deliberately:
+    core/ingestion.py's type inference has nothing to infer a type FROM
+    when a column is 100% empty -- exactly the headline case this cap
+    exists for (a Notes column with nothing in it at all) -- so it comes
+    back typed "unknown", not "text". Only a POSITIVELY confirmed
+    non-text type (numeric, date, boolean) rules the cap out.
+    """
+    name_lower = column_name.lower()
+    if any(hint in name_lower for hint in _MANDATORY_OVERRIDE_HINTS):
+        return False
+    if column_type not in (None, "text", "unknown"):
+        return False
+    return any(hint in name_lower for hint in _OPTIONAL_FREE_TEXT_NAME_HINTS)
+
+
+# issue_type -> the LOWEST severity that issue_type is ever allowed to be
+# classified as, regardless of what percentage-based calibration alone
+# would produce. These are all issue types that are a strong, concrete
+# signal of a real problem even when they affect only a few rows:
+#   - exact_duplicate_rows: an unambiguous, 100%-confidence data-
+#     integrity problem the moment even one exists.
+#   - invalid_type_in_numeric / invalid_type_in_date: a literal non-
+#     numeric/non-date string ("TBD", "unknown", "adult", "long", "ok")
+#     sitting in a column that's supposed to be numeric/date -- not a
+#     formatting quirk, a genuinely wrong kind of value.
+#   - domain_outlier: a value that parses fine but is impossible for
+#     what the column means (Age=-5, Rating=10, Fee=-100) -- see
+#     core/validity.py's own domain-rule catalog.
+# Deliberately NOT applied to structural_issue (a column that merely
+# LOOKS like an identifier having a few duplicates is still genuinely
+# rare/low-impact at low %) or to categorical_inconsistency/
+# fuzzy_duplicate_rows (their real-world severity legitimately tracks
+# how much of the column/table is affected, which percentage-based
+# calibration already handles once it isn't being skewed by capped
+# candidates -- see severity_cap above).
+_SEVERITY_FLOOR_BY_ISSUE_TYPE = {
+    "exact_duplicate_rows": SEVERITY_MODERATE,
+    "invalid_type_in_numeric": SEVERITY_MODERATE,
+    "invalid_type_in_date": SEVERITY_MODERATE,
+    "domain_outlier": SEVERITY_MODERATE,
+}
+
 # AI phrasing costs roughly 0.5-2 seconds per Finding (small local model,
-# but still not instant). A table with many issues could otherwise stall
-# the UI for a long time waiting on rephrasing that's a "nice to have",
-# not a requirement. So: only the most severe findings get the AI pass
-# -- findings are already sorted critical-first by the time this cap is
-# applied, so this means "spend the AI time budget on what matters most,
-# and every finding beyond the cap simply keeps its guaranteed,
-# instant, template-based sentence" -- never a missing or blank finding.
+# but still not instant), PLUS a one-time ~1-2s model-load cost the
+# first time it runs in a given process. A table with many issues could
+# otherwise stall the UI for well past the tool's own "scorecard in
+# under 20 seconds" target -- measured directly: 15 findings pushed one
+# run from 1.9s (no AI) to over 30s. So: only the most severe findings
+# get the AI pass -- findings are already sorted critical-first by the
+# time this cap is applied, so this means "spend the AI time budget on
+# what matters most, and every finding beyond the cap simply keeps its
+# guaranteed, instant, template-based sentence" -- never a missing or
+# blank finding. See AI_PHRASING_TIME_BUDGET_SECONDS below for the
+# second, wall-clock half of this same guarantee.
 MAX_FINDINGS_TO_AI_PHRASE = 15
+
+# Hard wall-clock ceiling on the WHOLE AI-phrasing pass, checked before
+# starting each finding's rephrasing (never mid-generation -- llama.cpp
+# gives no way to interrupt a single call partway through). This is what
+# actually bounds worst-case total time, independent of MAX_FINDINGS_TO_AI_PHRASE
+# above: a table that calibrates to only 3-4 findings but happens to hit
+# a slow cold model load, or a table with exactly 15 findings each
+# taking longer than the 0.5-2s estimate, both still finish in bounded
+# time. Once the budget is spent, every remaining finding simply keeps
+# its guaranteed, already-computed rule_based_description -- identical
+# in effect to "model unavailable" for that finding, never a missing or
+# blank one. Chosen so that, combined with the rest of the pipeline
+# (typically well under 2s for a small/medium file -- see
+# core/calibration.py, the only other non-trivial cost), the WHOLE
+# scorecard -- detection, scoring, AND the optional AI phrasing layer --
+# stays comfortably inside the tool's ~20 second target even on a cold
+# model load, rather than only bounding generation time and letting a
+# slow load blow the budget anyway.
+AI_PHRASING_TIME_BUDGET_SECONDS = 8.0
 
 # Which check_type each issue_type belongs to -- used to tag every
 # Finding with the right one of the four scorecard dimensions.
@@ -106,20 +219,33 @@ class _RawIssueCandidate:
     # this is for. None for every candidate type that doesn't need it
     # (every non-validity candidate, plus most validity ones).
     details: Optional[dict] = None
+    # See the severity_cap module docstring above. None for the
+    # overwhelming majority of candidates -- percentage-based
+    # calibration alone decides their severity, unchanged. (The
+    # companion severity FLOOR is looked up straight from
+    # _SEVERITY_FLOOR_BY_ISSUE_TYPE by issue_type, in generate_fix_list
+    # below -- it never varies per-column the way the cap does, so it
+    # doesn't need its own field here.)
+    severity_cap: Optional[str] = None
 
 
 # ---- Step 1: collect raw candidates (no severity decided yet) ------------
 
-def _collect_missing_data_candidates(completeness_result: CompletenessResult) -> List[_RawIssueCandidate]:
+def _collect_missing_data_candidates(
+    completeness_result: CompletenessResult, column_types: Optional[Dict[str, str]] = None,
+) -> List[_RawIssueCandidate]:
     candidates = []
     for column in completeness_result.per_column.values():
         if column.missing_percentage <= 0:
             continue
+        column_type = column_types.get(column.column_name) if column_types else None
+        is_optional_free_text = _is_optional_free_text_column(column.column_name, column_type)
         candidates.append(_RawIssueCandidate(
             issue_type="missing_data",
             column_name=column.column_name,
             percentage_affected=column.missing_percentage,
             format_kwargs={"field": column.column_name, "percentage": column.missing_percentage},
+            severity_cap=SEVERITY_MINOR if is_optional_free_text else None,
         ))
     return candidates
 
@@ -277,6 +403,7 @@ def generate_fix_list(
     table_name: str = "table",
     use_ai_phrasing: bool = True,
     validity_result: Optional[ValidityResult] = None,
+    column_types: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Finding], ThresholdCalibration, ThresholdCalibration]:
     """
     Build the full, severity-sorted list of Findings for one table. This
@@ -302,16 +429,33 @@ def generate_fix_list(
     is what keeps generate_fix_list backward-compatible: core/pipeline.py
     passes a real ValidityResult now, but nothing about this function's
     contract required that.
+
+    column_types: OPTIONAL {column_name: "text"/"numeric"/"date"/...}
+    map (straight from DatasetProfile). Used only to decide whether a
+    100%-empty column is genuinely optional free-text commentary (Notes,
+    Comments, ...) rather than a real data gap -- see
+    _is_optional_free_text_column. None (the default) means every
+    pre-existing caller keeps working exactly as before; the missing-data
+    severity cap simply never applies without type information to confirm
+    a column is actually text.
     """
     raw_candidates: List[_RawIssueCandidate] = []
-    raw_candidates += _collect_missing_data_candidates(completeness_result)
+    raw_candidates += _collect_missing_data_candidates(completeness_result, column_types)
     raw_candidates += _collect_consistency_candidates(consistency_result)
     raw_candidates += _collect_duplication_candidates(duplication_result, total_rows)
     raw_candidates += _collect_structure_candidates(structure_result)
     raw_candidates += _collect_validity_candidates(validity_result)
 
-    all_percentages = [candidate.percentage_affected for candidate in raw_candidates]
-    critical_cutoff, moderate_cutoff = calibrate_severity_thresholds(all_percentages)
+    # Candidates with a severity_cap already have a known, fixed ceiling
+    # on their outcome -- feeding their (often very high, e.g. a 100%-
+    # empty Notes column) percentage into calibration would only risk
+    # dragging THIS table's critical/moderate cutoffs up so high that a
+    # genuinely serious issue elsewhere gets under-classified as a side
+    # effect. Excluded from the pool, not from the findings list itself.
+    calibration_percentages = [
+        candidate.percentage_affected for candidate in raw_candidates if candidate.severity_cap is None
+    ]
+    critical_cutoff, moderate_cutoff = calibrate_severity_thresholds(calibration_percentages)
 
     # Fresh per call -- see _pick_template's docstring for why this must
     # not be module-level state.
@@ -320,6 +464,20 @@ def generate_fix_list(
     findings: List[Finding] = []
     for candidate in raw_candidates:
         severity = _severity_for_percentage(candidate.percentage_affected, critical_cutoff.value, moderate_cutoff.value)
+
+        # Floor: some issue types are a strong signal regardless of how
+        # small a percentage they affect (see _SEVERITY_FLOOR_BY_ISSUE_TYPE) --
+        # never let percentage-based calibration alone under-classify them.
+        floor = _SEVERITY_FLOOR_BY_ISSUE_TYPE.get(candidate.issue_type)
+        if floor is not None and SEVERITY_ORDER[severity] > SEVERITY_ORDER[floor]:
+            severity = floor
+
+        # Cap: the inverse case (see _is_optional_free_text_column) --
+        # never let percentage-based calibration alone over-classify a
+        # column that's low-stakes by construction, even at 100% empty.
+        if candidate.severity_cap is not None and SEVERITY_ORDER[severity] < SEVERITY_ORDER[candidate.severity_cap]:
+            severity = candidate.severity_cap
+
         template = _pick_template(candidate.issue_type, severity, template_pick_counters)
         rule_based_sentence = template.format(**candidate.format_kwargs)
 
@@ -353,13 +511,26 @@ def _apply_ai_phrasing(findings: List[Finding]) -> None:
     """
     Best-effort pass over the most severe findings (see
     MAX_FINDINGS_TO_AI_PHRASE), asking the local LLM to fill in
-    ai_phrased_description. Imported lazily (inside the function, not at
-    module top) so that core/fixlist.py -- and everything that imports
-    it -- never fails to import just because llama-cpp-python isn't
-    installed; the import only happens at call time, inside a module
-    that already handles its own absence gracefully.
+    ai_phrased_description -- bounded by BOTH a count cap and a
+    wall-clock time budget (AI_PHRASING_TIME_BUDGET_SECONDS), whichever
+    is hit first. Imported lazily (inside the function, not at module
+    top) so that core/fixlist.py -- and everything that imports it --
+    never fails to import just because llama-cpp-python isn't installed;
+    the import only happens at call time, inside a module that already
+    handles its own absence gracefully.
+
+    The time check runs BEFORE each finding's call, never during one --
+    there's no way to interrupt a single llama.cpp generation partway
+    through, so this bounds how many NEW rephrasings get started once
+    the budget is spent, not any individual call's own duration. Every
+    finding this loop doesn't reach keeps its guaranteed
+    rule_based_description untouched -- exactly the same fallback path
+    as "AI unavailable", just triggered by the clock instead.
     """
     from core.llm_phrasing import phrase_finding
 
+    start_time = time.monotonic()
     for finding in findings[:MAX_FINDINGS_TO_AI_PHRASE]:
+        if time.monotonic() - start_time > AI_PHRASING_TIME_BUDGET_SECONDS:
+            break
         finding.ai_phrased_description = phrase_finding(finding)

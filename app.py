@@ -1228,11 +1228,7 @@ def render_remediation_section(table_result) -> None:
         tokens = _theme_tokens()
         charts = generate_charts_for_table(table_result.dataframe, table_result.column_types, table_result.findings)
         for chart in charts:
-            annotation_html = (
-                f' <span style="color:var(--moderate); font-size:.82rem; font-weight:600;">{_html(chart.annotation)}</span>'
-                if chart.annotation else ""
-            )
-            render_html(f'<div class="mdq-finding-text" style="margin:.9rem 0 .3rem;"><b>{_html(chart.column_name)}</b>{annotation_html}</div>')
+            render_html(f'<div class="mdq-finding-text" style="margin:.9rem 0 .3rem;"><b>{_html(chart.column_name)}</b></div>')
 
             if chart.chart_data is None:
                 render_html('<div class="mdq-table-sub">Not enough data in this column to chart.</div>')

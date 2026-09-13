@@ -143,6 +143,7 @@ def run_pipeline_for_table(
         table_name=table_name,
         use_ai_phrasing=use_ai_phrasing,
         validity_result=validity_result,
+        column_types=dataset_profile.column_types,
     )
 
     duplicate_threshold = ThresholdCalibration(

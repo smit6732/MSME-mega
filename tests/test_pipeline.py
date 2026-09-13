@@ -1612,6 +1612,258 @@ def test_validity_flags_extreme_total_amount_via_iqr():
     assert len(candidates) == 1
 
 
+# ---- Scoring/severity/uniqueness overhaul: false-Critical & inverted-severity fixes ----
+
+def test_empty_optional_free_text_column_is_capped_at_minor_not_critical():
+    """A 100%-empty Notes/Comments/Remarks/Description/Feedback column is
+    the single highest percentage a table can produce -- pure percentage
+    calibration would make it look like the worst problem in the file.
+    It must be capped at minor, never moderate or critical."""
+    import pandas as pd
+    from core.consistency import check_consistency
+    from core.duplication import check_duplication
+    from core.structure import check_structure
+    from core.fixlist import generate_fix_list
+
+    row_count = 20
+    dataframe = pd.DataFrame({
+        "Order_ID": [f"ORD-{i:04d}" for i in range(row_count)],
+        "Amount": [100 + i for i in range(row_count)],
+        "Notes": [None] * row_count,
+        "Comments": [""] * row_count,
+        "Remarks": [None] * row_count,
+        "Description": [None] * row_count,
+        "Additional_Info": [None] * row_count,
+        "Feedback": [None] * row_count,
+    })
+    column_types = {
+        "Order_ID": "text", "Amount": "numeric", "Notes": "unknown", "Comments": "unknown",
+        "Remarks": "unknown", "Description": "unknown", "Additional_Info": "unknown", "Feedback": "unknown",
+    }
+
+    completeness_result = check_completeness(dataframe)
+    consistency_result = check_consistency(dataframe, column_types)
+    duplication_result = check_duplication(dataframe, column_types)
+    structure_result = check_structure(dataframe)
+
+    findings, _crit, _mod = generate_fix_list(
+        completeness_result, consistency_result, duplication_result, structure_result,
+        row_count, table_name="t", use_ai_phrasing=False, column_types=column_types,
+    )
+
+    optional_column_names = {"Notes", "Comments", "Remarks", "Description", "Additional_Info", "Feedback"}
+    optional_findings = [f for f in findings if f.column_name in optional_column_names]
+    assert len(optional_findings) == len(optional_column_names)
+    for finding in optional_findings:
+        assert finding.severity == "minor", f"{finding.column_name} was {finding.severity}, expected minor"
+
+
+def test_mandatory_named_empty_column_is_not_suppressed():
+    """A column that names itself as required (Mandatory_Notes,
+    Required_Comment) must NOT get the optional-free-text cap, even
+    though it also matches the free-text hint words."""
+    from core.fixlist import _is_optional_free_text_column
+
+    assert _is_optional_free_text_column("Notes", "text") is True
+    assert _is_optional_free_text_column("Notes", "unknown") is True
+    assert _is_optional_free_text_column("Mandatory_Notes", "text") is False
+    assert _is_optional_free_text_column("Required_Comment", "text") is False
+    assert _is_optional_free_text_column("Amount", "numeric") is False  # not a free-text hint at all
+
+
+def test_repeating_patient_name_with_stable_attributes_is_not_a_duplicate():
+    """The exact scenario this fix targets: Patient_042 visits several
+    times, and its OWN attributes (age, standard fee) are naturally the
+    same across visits -- that must not be mistaken for a duplicated
+    appointment record. Appointment_ID (the real per-row key) differs
+    every time."""
+    import pandas as pd
+    from core.duplication import check_duplication
+
+    dataframe = pd.DataFrame({
+        "Appointment_ID": [f"APT-{i:04d}" for i in range(10)],
+        "Patient_Name": (["Patient_042"] * 3) + (["Patient_017"] * 3) + (["Patient_099"] * 4),
+        "Doctor": ["Dr. Sharma"] * 8 + ["Dr. Gupta"] * 2,
+        "Status": ["Completed"] * 9 + ["Cancelled"],
+        "Age": [45, 45, 45, 62, 62, 62, 33, 33, 33, 33],
+        "Fee": [500, 500, 500, 600, 600, 650, 550, 550, 550, 550],
+    })
+    column_types = {
+        "Appointment_ID": "text", "Patient_Name": "text", "Doctor": "text",
+        "Status": "text", "Age": "numeric", "Fee": "numeric",
+    }
+    result = check_duplication(dataframe, column_types)
+
+    assert result.exact_duplicate_row_indexes == []
+    assert result.fuzzy_duplicate_pairs == []
+    assert result.duplication_score == 100.0
+
+
+def test_domain_outlier_and_dirty_numeric_get_a_moderate_floor_even_at_low_percentage():
+    """Clear domain outliers (Age=-5) and dirty strings in a numeric
+    column ("adult") are a strong signal of a real problem even when
+    they affect only a small % of rows -- must never be classified
+    below moderate, unlike a pure percentage-calibrated result would."""
+    import pandas as pd
+    from core.consistency import check_consistency
+    from core.duplication import check_duplication
+    from core.structure import check_structure
+    from core.fixlist import generate_fix_list
+
+    row_count = 50
+    ages = ["30"] * (row_count - 2) + ["-5", "adult"]
+    dataframe = pd.DataFrame({
+        "Order_ID": [f"ORD-{i:04d}" for i in range(row_count)],
+        "Age": ages,
+    })
+    column_types = {"Order_ID": "text", "Age": "numeric"}
+
+    completeness_result = check_completeness(dataframe)
+    consistency_result = check_consistency(dataframe, column_types)
+    duplication_result = check_duplication(dataframe, column_types)
+    structure_result = check_structure(dataframe)
+    validity_result = check_validity(dataframe, column_types)
+
+    findings, _crit, _mod = generate_fix_list(
+        completeness_result, consistency_result, duplication_result, structure_result,
+        row_count, table_name="t", use_ai_phrasing=False,
+        validity_result=validity_result, column_types=column_types,
+    )
+
+    outlier_findings = [f for f in findings if f.issue_type in ("domain_outlier", "invalid_type_in_numeric")]
+    assert outlier_findings
+    for finding in outlier_findings:
+        assert finding.percentage_affected < 10.0  # confirms this is genuinely a LOW-percentage case
+        assert finding.severity in ("moderate", "critical")  # never "minor" despite the low percentage
+
+
+def test_exact_duplicate_rows_get_a_moderate_floor():
+    """An exact duplicate row is a 100%-confidence data-integrity problem
+    the moment even one exists -- must never be classified as minor just
+    because it's a small share of a large table."""
+    import pandas as pd
+    from core.consistency import check_consistency
+    from core.duplication import check_duplication
+    from core.structure import check_structure
+    from core.fixlist import generate_fix_list
+
+    row_count = 200
+    rows = {"Order_ID": [f"ORD-{i:04d}" for i in range(row_count)], "Amount": list(range(row_count))}
+    dataframe = pd.DataFrame(rows)
+    # Plant exactly one exact-duplicate row (a small % of a 200-row table).
+    dataframe.loc[199] = dataframe.loc[0]
+    column_types = {"Order_ID": "text", "Amount": "numeric"}
+
+    completeness_result = check_completeness(dataframe)
+    consistency_result = check_consistency(dataframe, column_types)
+    duplication_result = check_duplication(dataframe, column_types)
+    structure_result = check_structure(dataframe)
+
+    findings, _crit, _mod = generate_fix_list(
+        completeness_result, consistency_result, duplication_result, structure_result,
+        row_count, table_name="t", use_ai_phrasing=False, column_types=column_types,
+    )
+
+    exact_dup_findings = [f for f in findings if f.issue_type == "exact_duplicate_rows"]
+    assert len(exact_dup_findings) == 1
+    assert exact_dup_findings[0].percentage_affected < 10.0
+    assert exact_dup_findings[0].severity in ("moderate", "critical")
+
+
+def test_appointment_id_and_invoice_no_still_enforce_uniqueness():
+    """Appointment_ID/Invoice_No are genuine primary-key-style
+    transaction keys -- a repeated value is still a real structural
+    problem and must still be caught."""
+    import pandas as pd
+    from core.structure import check_structure
+
+    dataframe = pd.DataFrame({
+        "Appointment_ID": ["APT-0001", "APT-0002", "APT-0001", "APT-0003"],
+        "Invoice_No": ["INV-01", "INV-02", "INV-03", "INV-01"],
+    })
+    result = check_structure(dataframe)
+    flagged_columns = {issue.column_name for issue in result.issues if issue.issue_type == "duplicate_identifier"}
+    assert "Appointment_ID" in flagged_columns
+    assert "Invoice_No" in flagged_columns
+
+
+def test_patient_doctor_department_do_not_trigger_uniqueness_errors():
+    """Patient_Name, Customer_ID, Doctor, Department, and Status all
+    legitimately repeat in transactional/clinical data and must never be
+    treated as if they need to be unique."""
+    import pandas as pd
+    from core.structure import check_structure
+
+    dataframe = pd.DataFrame({
+        "Patient_Name": ["Patient_042"] * 4,
+        "Customer_ID": ["CUST-01"] * 4,
+        "Doctor": ["Dr. Sharma"] * 4,
+        "Department": ["Cardiology"] * 4,
+        "Status": ["Completed"] * 4,
+    })
+    result = check_structure(dataframe)
+    flagged_columns = {issue.column_name for issue in result.issues if issue.issue_type == "duplicate_identifier"}
+    assert flagged_columns == set()
+
+
+# ---- Performance: AI phrasing must never blow the "scorecard under 20s" target ----
+
+def test_ai_phrasing_respects_its_time_budget_even_with_many_slow_findings():
+    """
+    Regression test for a real, measured bug: a table with the full
+    MAX_FINDINGS_TO_AI_PHRASE worth of findings pushed generation from
+    ~2s (no AI) to over 30s, because the AI-phrasing pass had a COUNT
+    cap but no WALL-CLOCK cap -- a slow model call (or just a lot of
+    findings) had no bound on total time. Verified directly against the
+    time-budget mechanism (core/fixlist.py's AI_PHRASING_TIME_BUDGET_SECONDS)
+    with a fake, deliberately slow phrase_finding -- not the real local
+    model, which may not even be downloaded in this environment (see
+    core/llm_phrasing.py's own is_model_available skip pattern) and
+    whose real timing would make this test itself slow and flaky.
+    """
+    import time
+    import core.fixlist as fixlist
+    import core.llm_phrasing as llm_phrasing
+    from core.findings import Finding
+
+    call_count = {"n": 0}
+
+    def _slow_phrase_finding(finding):
+        call_count["n"] += 1
+        time.sleep(0.05)  # stands in for a real ~1-4s model call, scaled down so this test stays fast
+        return "a phrased sentence"
+
+    findings = [
+        Finding(
+            table_name="t", column_name=f"col_{i}", check_type="completeness", issue_type="missing_data",
+            percentage_affected=10.0, severity="minor", rule_based_description="placeholder",
+        )
+        for i in range(50)  # far more than MAX_FINDINGS_TO_AI_PHRASE
+    ]
+
+    original_phrase_finding = llm_phrasing.phrase_finding
+    original_budget = fixlist.AI_PHRASING_TIME_BUDGET_SECONDS
+    llm_phrasing.phrase_finding = _slow_phrase_finding
+    fixlist.AI_PHRASING_TIME_BUDGET_SECONDS = 0.12  # shrunk so the test itself doesn't take the real 8s budget
+    try:
+        start = time.monotonic()
+        fixlist._apply_ai_phrasing(findings)
+        elapsed = time.monotonic() - start
+    finally:
+        llm_phrasing.phrase_finding = original_phrase_finding
+        fixlist.AI_PHRASING_TIME_BUDGET_SECONDS = original_budget
+
+    # The pass must stop close to the budget (plus at most one in-flight
+    # call), never anywhere near "all 50 findings, one at a time".
+    assert elapsed < 1.0
+    assert call_count["n"] < len(findings)
+    # Every finding beyond the budget keeps its guaranteed template
+    # sentence untouched -- nothing silently blank or missing.
+    for finding in findings:
+        assert finding.rule_based_description == "placeholder"
+        assert finding.ai_phrased_description in (None, "a phrased sentence")
+
+
 if __name__ == "__main__":
     # Allow running as a plain script too: python tests/test_pipeline.py
     import traceback
@@ -1691,6 +1943,14 @@ if __name__ == "__main__":
         test_validity_flags_customer_rating_outside_one_to_five,
         test_validity_flags_zero_quantity_and_remediation_blanks_it,
         test_validity_flags_extreme_total_amount_via_iqr,
+        test_empty_optional_free_text_column_is_capped_at_minor_not_critical,
+        test_mandatory_named_empty_column_is_not_suppressed,
+        test_repeating_patient_name_with_stable_attributes_is_not_a_duplicate,
+        test_domain_outlier_and_dirty_numeric_get_a_moderate_floor_even_at_low_percentage,
+        test_exact_duplicate_rows_get_a_moderate_floor,
+        test_appointment_id_and_invoice_no_still_enforce_uniqueness,
+        test_patient_doctor_department_do_not_trigger_uniqueness_errors,
+        test_ai_phrasing_respects_its_time_budget_even_with_many_slow_findings,
     ]
     failures = 0
     for test_function in test_functions:

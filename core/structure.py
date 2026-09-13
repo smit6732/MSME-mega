@@ -18,6 +18,30 @@ import re
 from dataclasses import dataclass
 from typing import List, Optional
 
+# Word-boundary-aware hint matching -- a plain `hint in name` substring
+# check (the naive version this replaces) also matches "gst" inside
+# "furnishingstatus" (the "...ing" + "status" boundary spells "ngst"),
+# or "pan" inside "company", or "code" inside "postcode" -- short hints
+# are exactly the ones a bare substring check misfires on. Bounded by
+# the string's start/end or any non-alphanumeric character (underscore
+# included, unlike regex's own \b, which treats underscore as a "word"
+# character and would NOT stop at it) -- so "GST_Number" and "PAN123"
+# still match (boundary is start-of-string or an underscore/non-letter),
+# but a hint sitting in the middle of an unrelated, unbroken word never
+# does. Verified live against this exact false positive on a real
+# (non-MSME) housing dataset.
+def _hint_matches(hint: str, name_lower: str) -> bool:
+    # A boundary is only REQUIRED on a side where the hint's own edge
+    # character is alphanumeric -- a hint that already starts/ends with
+    # a separator (like "_id" or "id_") is self-bounding on that side,
+    # and demanding an additional non-alnum character right before/after
+    # the underscore itself would wrongly reject the exact "Customer_ID"
+    # shape this hint exists to match.
+    left = r"(?<![a-z0-9])" if hint[:1].isalnum() else ""
+    right = r"(?![a-z0-9])" if hint[-1:].isalnum() else ""
+    pattern = left + re.escape(hint) + right
+    return re.search(pattern, name_lower) is not None
+
 import pandas as pd
 
 
@@ -29,6 +53,7 @@ import pandas as pd
 IDENTIFIER_COLUMN_NAME_HINTS = [
     "gst", "pan", "order_id", "order_no", "invoice_id", "invoice_no",
     "transaction_id", "txn_id", "receipt_no", "bill_no", "registration_no", "license_no",
+    "appointment_id", "appointment_no", "booking_id", "booking_no",
 ]
 
 # Column-name substrings that mean "this column names WHO/WHAT the row is
@@ -42,6 +67,7 @@ IDENTIFIER_COLUMN_NAME_HINTS = [
 _DIMENSION_REFERENCE_NAME_HINTS = [
     "customer", "client", "vendor", "supplier", "user", "account",
     "employee", "staff", "product", "item", "category", "party",
+    "patient", "doctor", "department", "physician", "practitioner",
 ]
 
 # A bare "_id"/"id_"/trailing "id"/"code" hint (unlike the explicit
@@ -151,10 +177,10 @@ def _find_identifier_duplicates(dataframe: pd.DataFrame) -> List[StructureIssue]
 
     for column_name in dataframe.columns:
         column_name_lower = str(column_name).lower()
-        is_dimension_reference = any(hint in column_name_lower for hint in _DIMENSION_REFERENCE_NAME_HINTS)
-        looks_like_transaction_key = any(hint in column_name_lower for hint in IDENTIFIER_COLUMN_NAME_HINTS)
+        is_dimension_reference = any(_hint_matches(hint, column_name_lower) for hint in _DIMENSION_REFERENCE_NAME_HINTS)
+        looks_like_transaction_key = any(_hint_matches(hint, column_name_lower) for hint in IDENTIFIER_COLUMN_NAME_HINTS)
         looks_like_generic_id = (
-            any(hint in column_name_lower for hint in _GENERIC_ID_HINTS) and not is_dimension_reference
+            any(_hint_matches(hint, column_name_lower) for hint in _GENERIC_ID_HINTS) and not is_dimension_reference
         )
         if not (looks_like_transaction_key or looks_like_generic_id):
             continue

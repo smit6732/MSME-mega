@@ -21,3 +21,16 @@ toolbarMode = "minimal"
 
 [browser]
 gatherUsageStats = false
+
+[server]
+# Streamlit's own file watcher (for auto-rerun on save) recursively
+# scans the WHOLE working directory by default -- including venv/,
+# which alone holds 17,000+ files (numpy/scipy/sklearn/pandas/
+# streamlit's own site-packages). Setting up a watch on all of that is
+# a real, measurable contributor to slow startup, especially on
+# Windows where antivirus real-time scanning adds further overhead per
+# file the watcher touches. Excluding it (and the other directories
+# below, none of which contain source this app needs to hot-reload on)
+# keeps auto-rerun working for actual edits to app.py/core/*.py while
+# skipping the vendor/model/cache noise entirely.
+folderWatchBlacklist = ["venv", ".git", "models", "__pycache__", ".pytest_cache", "sample_data"]

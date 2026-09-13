@@ -53,7 +53,19 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
-from sklearn.cluster import KMeans
+# scikit-learn is intentionally NOT imported here at module level.
+# Importing sklearn.cluster pulls in scipy/joblib/threadpoolctl behind
+# it and costs roughly a full second on a typical machine -- paid at
+# app.py's very first `import core.pipeline` (before a user has even
+# uploaded a file) if this were a top-level import, since
+# core/pipeline.py -> core/duplication.py/core/fixlist.py -> this
+# module gets imported eagerly at Streamlit startup. Deferred into
+# _fit_kmeans_and_get_sorted_cluster_ranges below -- the ONLY place
+# KMeans is actually used -- so the cost is paid at most once, the
+# first time a file is actually calibrated, and never at all for a
+# table whose data is too small/uniform to reach that function (see
+# both calibrate_* functions' early "not enough data" fallback, which
+# also needs no import at all).
 
 # Fixed random seed for every KMeans call in this file. See module
 # docstring: determinism is a hard requirement, and KMeans' default
@@ -227,6 +239,8 @@ def _fit_kmeans_and_get_sorted_cluster_ranges(
     of numbers into a column of single-value "points", which is the
     standard way to cluster 1-D data with this API.
     """
+    from sklearn.cluster import KMeans  # lazy -- see this module's top-of-file note for why
+
     values_array = np.array(values, dtype=float).reshape(-1, 1)
     kmeans = KMeans(n_clusters=n_clusters, random_state=_KMEANS_RANDOM_STATE, n_init=_KMEANS_N_INIT)
     cluster_labels = kmeans.fit_predict(values_array)
