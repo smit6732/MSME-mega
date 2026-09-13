@@ -25,9 +25,9 @@ from core.ingestion import load_dataset, load_all_tables
 from core.pipeline import run_pipeline_for_table, run_multi_table_pipeline
 from core.calibration import calibrate_duplicate_threshold, calibrate_severity_thresholds
 from core.findings import Finding
-from core.remediation import remediate_table
+from core.remediation import remediate_table, _apply_or_decline_date
 from core.chart_generation import generate_charts_for_table
-from core.validity import check_validity, is_coercible_numeric_token, is_recognized_date_token
+from core.validity import check_validity, is_coercible_numeric_token, is_recognized_date_token, categorical_key
 from core.completeness import check_completeness
 from core.scoring import build_scorecard
 from core.cleaning_config import CleaningConfig, CONSERVATIVE, STANDARD, AGGRESSIVE, MISSING_STRATEGY_DROP_ROW, MISSING_STRATEGY_CONSTANT
@@ -1363,6 +1363,255 @@ def test_end_to_end_messy_car_price_dataset():
         assert item.reason  # every manual-review reason is non-empty, plain language
 
 
+# ---- Phase 4: false-positive fixes on transactional/order data ------------
+
+def test_repeating_customer_id_in_order_data_is_not_a_structural_issue():
+    """The classic false positive this phase fixes: Customer_ID repeating
+    across many different orders (normal transactional data) must NOT be
+    flagged as 'should be a unique identifier' -- only a real per-row
+    transaction key (Order_ID) should be."""
+    import pandas as pd
+    from core.structure import check_structure
+
+    dataframe = pd.DataFrame({
+        "Order_ID": ["ORD-001", "ORD-002", "ORD-003", "ORD-004"],
+        "Customer_ID": ["CUST-100", "CUST-100", "CUST-100", "CUST-101"],
+        "Customer_Name": ["Amit Shah", "Amit Shah", "Amit Shah", "Priya Rao"],
+    })
+    result = check_structure(dataframe)
+
+    issue_columns = {issue.column_name for issue in result.issues}
+    assert "Customer_ID" not in issue_columns
+    assert "Customer_Name" not in issue_columns
+
+
+def test_duplicate_order_id_still_flagged_as_structural_issue():
+    """The fix must not blunt real detection -- a genuinely repeating
+    transaction key is still a structural problem."""
+    import pandas as pd
+    from core.structure import check_structure
+
+    dataframe = pd.DataFrame({"Order_ID": ["ORD-001", "ORD-002", "ORD-001"], "Amount": ["100", "200", "300"]})
+    result = check_structure(dataframe)
+
+    issue_columns = {issue.column_name for issue in result.issues}
+    assert "Order_ID" in issue_columns
+
+
+def test_repeat_customer_across_orders_is_not_a_fuzzy_duplicate():
+    """The other half of the same false positive: the SAME customer name
+    appearing on several different orders (different amounts/dates) must
+    not be reported as a near-duplicate RECORD -- it's a normal repeat
+    customer, not two copies of one order."""
+    import pandas as pd
+    from core.duplication import check_duplication
+
+    dataframe = pd.DataFrame({
+        "Customer_Name": ["Amit Shah", "Amit Shah", "Amit Shah", "Priya Rao", "Priya Rao", "Neha Verma"],
+        "Order_Amount": ["1000", "2500", "750", "3000", "1200", "500"],
+        "Order_Date": ["2024-01-05", "2024-02-11", "2024-03-02", "2024-01-19", "2024-02-28", "2024-01-30"],
+    })
+    result = check_duplication(dataframe, {"Customer_Name": "text", "Order_Amount": "numeric", "Order_Date": "date"})
+
+    assert result.exact_duplicate_row_indexes == []
+    assert result.fuzzy_duplicate_pairs == []
+
+
+def test_near_duplicate_record_with_matching_row_is_still_caught():
+    """The fix must not blunt real detection -- two rows with a genuine
+    SPELLING VARIANT on the identity column AND a matching rest-of-row
+    are still exactly the near-duplicate scenario this check exists for."""
+    import pandas as pd
+    from core.duplication import check_duplication
+
+    dataframe = pd.DataFrame({
+        "Business_Name": [
+            "Shree Ganesh Traders", "Shri Ganesh Traders", "Om Sai Distributors",
+            "Krishna Enterprises", "Patel Hardware", "Singh Textiles", "Sharma Foods",
+        ],
+        "City": ["Ahmedabad", "Ahmedabad", "Surat", "Vadodara", "Rajkot", "Bhavnagar", "Anand"],
+    })
+    result = check_duplication(dataframe, {"Business_Name": "text", "City": "text"})
+
+    assert len(result.fuzzy_duplicate_pairs) >= 1
+
+
+# ---- Phase 2: new domain rules (Rating, Discount) --------------------------
+
+def test_validity_flags_rating_and_discount_out_of_bounds():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "Rating": ["4", "5", "3", "15"],
+        "Discount_Percent": ["10", "20", "150", "5"],
+    })
+    result = check_validity(dataframe, {"Rating": "numeric", "Discount_Percent": "numeric"})
+
+    rating_candidates = [c for c in result.candidates if c.column_name == "Rating"]
+    assert len(rating_candidates) == 1 and rating_candidates[0].issue_type == "domain_outlier"
+
+    discount_candidates = [c for c in result.candidates if c.column_name == "Discount_Percent"]
+    assert len(discount_candidates) == 1 and discount_candidates[0].issue_type == "domain_outlier"
+
+
+def test_validity_known_alias_dictionary_maps_abbreviations_and_city_variants():
+    """DC/NB/city-name aliases are curated domain knowledge, applied even
+    though they share almost no characters with their canonical form (so
+    no similarity score would ever safely link them)."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "Payment_Method": [
+            "Debit Card", "Debit Card", "Debit Card", "Debit Card", "DC", "DC",
+            "Net Banking", "Net Banking", "Net Banking", "NB",
+        ],
+        "City": ["Delhi", "Delhi", "Delhi", "Delhi", "Dilli", "Dilli", "Chennai", "Chennai", "Chennai", "Madras"],
+    })
+    result = check_validity(dataframe, {"Payment_Method": "text", "City": "text"})
+
+    payment_candidate = next(c for c in result.candidates if c.column_name == "Payment_Method")
+    payment_map = payment_candidate.details["canonical_map"]
+    assert payment_map[categorical_key("DC")]["canonical"] == "Debit Card"
+    assert payment_map[categorical_key("NB")]["canonical"] == "Net Banking"
+
+    city_candidate = next(c for c in result.candidates if c.column_name == "City")
+    city_map = city_candidate.details["canonical_map"]
+    assert city_map[categorical_key("Dilli")]["canonical"] == "Delhi"
+    assert city_map[categorical_key("Madras")]["canonical"] == "Chennai"
+
+
+def test_validity_new_delhi_only_folds_into_delhi_when_delhi_is_dominant():
+    """The conditional alias must NOT fire when its target isn't actually
+    this column's own established spelling -- avoids silently renaming a
+    genuinely distinct place."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "City": ["New Delhi", "New Delhi", "New Delhi", "Mumbai", "Pune"],
+    })
+    result = check_validity(dataframe, {"City": "text"})
+    city_candidates = [c for c in result.candidates if c.column_name == "City"]
+    if city_candidates:
+        canonical_map = city_candidates[0].details.get("canonical_map", {})
+        assert categorical_key("New Delhi") not in canonical_map
+
+
+def test_remediation_normalizes_month_name_dates_unambiguously():
+    """DD-Mon-YYYY (and similar) formats are unambiguous by construction
+    -- a month NAME resolves day/month order completely, unlike an
+    all-numeric date -- so these must normalize, not land on manual review."""
+    import pandas as pd
+    from core.findings import Finding
+
+    dataframe = pd.DataFrame({"Order_Date": ["15-Jan-2020", "3 Feb 2021", "20-12-2015", "2020-05-01"]})
+    finding = Finding(
+        table_name="t", issue_type="inconsistent_format_date", column_name="Order_Date", check_type="consistency",
+        severity="minor", percentage_affected=75.0, example="15-Jan-2020",
+        rule_based_description="Mixed date formats.",
+    )
+    actions, manual_review = [], []
+    _apply_or_decline_date(dataframe, finding, actions, manual_review)
+
+    assert len(actions) == 1
+    assert dataframe.loc[0, "Order_Date"] == "2020-01-15"
+    assert dataframe.loc[1, "Order_Date"] == "2021-02-03"
+    assert dataframe.loc[2, "Order_Date"] == "2015-12-20"
+
+
+def test_validity_flags_extreme_quantity_via_iqr_but_not_wide_legitimate_revenue():
+    """Quantity/count-shaped columns get an extra statistical extreme-
+    value check (999/5000 among mostly single-digit orders is a strong
+    error signal); Revenue/Amount-shaped columns deliberately do NOT, so
+    a company with legitimately much higher revenue than its peers isn't
+    misflagged as a data error."""
+    import pandas as pd
+
+    quantity_df = pd.DataFrame({
+        "Quantity": ["2", "3", "1", "4", "5", "6", "7", "8", "2", "3", "999"],
+    })
+    quantity_result = check_validity(quantity_df, {"Quantity": "numeric"})
+    quantity_candidates = [c for c in quantity_result.candidates if c.issue_type == "domain_outlier"]
+    assert len(quantity_candidates) == 1
+
+    revenue_df = pd.DataFrame({
+        "Annual_Revenue": ["500000", "600000", "550000", "480000", "5200000", "530000", "610000", "490000"],
+    })
+    revenue_result = check_validity(revenue_df, {"Annual_Revenue": "numeric"})
+    revenue_candidates = [c for c in revenue_result.candidates if c.issue_type == "domain_outlier"]
+    assert len(revenue_candidates) == 0
+
+
+def test_validity_flags_residual_typo_in_high_cardinality_categorical_column():
+    """A column with many legitimate, genuinely-repeated categories (real
+    cities) plus one close-typo variant must still be caught -- the
+    cardinality guard protects genuine free text (nothing repeats), not
+    a categorical column that merely has several real categories."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "City": [
+            "Chennai", "Chennai", "Chennai", "Chennnai",
+            "Mumbai", "Mumbai", "Bangalore", "Bangalore", "Delhi", "Delhi",
+        ],
+    })
+    result = check_validity(dataframe, {"City": "text"})
+    candidate = next(c for c in result.candidates if c.column_name == "City")
+    canonical_map = candidate.details["canonical_map"]
+    assert canonical_map[categorical_key("Chennnai")]["canonical"] == "Chennai"
+    assert canonical_map[categorical_key("Chennnai")]["score"] >= 88.0
+
+
+def test_validity_flags_customer_rating_outside_one_to_five():
+    """Customer_Rating is unambiguously a 1-5 scale by name -- narrower
+    and more specific than the generic 0-10 'rating' catch-all."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Customer_Rating": ["4", "5", "1", "3", "9"]})
+    result = check_validity(dataframe, {"Customer_Rating": "numeric"})
+    candidate = next(c for c in result.candidates if c.column_name == "Customer_Rating")
+    assert candidate.issue_type == "domain_outlier"
+    assert candidate.details["lower_bound"] == 1.0
+    assert candidate.details["upper_bound"] == 5.0
+
+
+def test_validity_flags_zero_quantity_and_remediation_blanks_it():
+    """Quantity <= 0 (not just < 0) is invalid -- an order line can't
+    have zero items -- and remediation must reuse this exact bound."""
+    import pandas as pd
+    from core.findings import Finding
+
+    dataframe = pd.DataFrame({"Quantity": ["2", "3", "1", "4", "5", "6", "7", "0", "-1"]})
+    result = check_validity(dataframe, {"Quantity": "numeric"})
+    candidate = next(c for c in result.candidates if c.column_name == "Quantity")
+    assert candidate.details["min_exclusive"] is True
+
+    finding = Finding(
+        table_name="t", issue_type="domain_outlier", column_name="Quantity", check_type="validity",
+        severity="critical", percentage_affected=candidate.percentage_affected, example=candidate.example,
+        rule_based_description="Quantity out of range.", details=candidate.details,
+    )
+    remediation = remediate_table(dataframe, [finding], [])
+    cleaned = remediation.cleaned_dataframe["Quantity"]
+    assert pd.isna(cleaned.iloc[7])  # the "0"
+    assert pd.isna(cleaned.iloc[8])  # the "-1"
+    assert cleaned.iloc[0] == "2"    # untouched
+
+
+def test_validity_flags_extreme_total_amount_via_iqr():
+    """Total_Amount (unlike Revenue) is transaction-scoped within one
+    file and gets the IQR extreme-outlier check too -- one wildly
+    inflated amount among consistent order totals is a strong error
+    signal here, not legitimate wide business variance."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "Total_Amount": ["1000", "1200", "950", "1100", "1050", "990", "1150", "999999"],
+    })
+    result = check_validity(dataframe, {"Total_Amount": "numeric"})
+    candidates = [c for c in result.candidates if c.issue_type == "domain_outlier"]
+    assert len(candidates) == 1
+
+
 if __name__ == "__main__":
     # Allow running as a plain script too: python tests/test_pipeline.py
     import traceback
@@ -1429,6 +1678,19 @@ if __name__ == "__main__":
         test_remediation_domain_outlier_default_blanks_clip_mode_clips,
         test_remediation_missing_data_strategy_drop_row_and_constant,
         test_end_to_end_messy_car_price_dataset,
+        test_repeating_customer_id_in_order_data_is_not_a_structural_issue,
+        test_duplicate_order_id_still_flagged_as_structural_issue,
+        test_repeat_customer_across_orders_is_not_a_fuzzy_duplicate,
+        test_near_duplicate_record_with_matching_row_is_still_caught,
+        test_validity_flags_rating_and_discount_out_of_bounds,
+        test_validity_known_alias_dictionary_maps_abbreviations_and_city_variants,
+        test_validity_new_delhi_only_folds_into_delhi_when_delhi_is_dominant,
+        test_remediation_normalizes_month_name_dates_unambiguously,
+        test_validity_flags_extreme_quantity_via_iqr_but_not_wide_legitimate_revenue,
+        test_validity_flags_residual_typo_in_high_cardinality_categorical_column,
+        test_validity_flags_customer_rating_outside_one_to_five,
+        test_validity_flags_zero_quantity_and_remediation_blanks_it,
+        test_validity_flags_extreme_total_amount_via_iqr,
     ]
     failures = 0
     for test_function in test_functions:

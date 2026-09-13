@@ -41,9 +41,12 @@ so a business name containing `<`, `>`, or `&` can never break the
 page's markup.
 """
 
+import datetime
 import html
 import io
+import json
 import re
+from typing import Optional
 from urllib.parse import quote
 
 import altair as alt
@@ -1046,6 +1049,40 @@ _CLEANING_INTENSITY_HELP = (
 )
 
 
+def _audit_report_text(table_result, remediation, intensity_choice: str) -> str:
+    """
+    A plain-text, human-readable export of everything render_remediation_section
+    shows on screen -- every RemediationAction (with before/after) and
+    every ManualReviewItem (with its reason) -- so the audit trail this
+    project promises can leave the browser tab (attach it to an email,
+    keep it as a compliance record) without needing a screenshot. Built
+    from the SAME `remediation` object the on-screen audit log renders
+    from, never a re-derived summary, so the two can never disagree.
+    """
+    lines = [
+        f"Audit report -- {table_result.table_name}",
+        f"Cleaning intensity: {intensity_choice}",
+        f"Original score (from raw data): {table_result.scorecard.overall_score:.1f}/100",
+        "",
+        f"Fixes applied ({len(remediation.actions)}):",
+    ]
+    if not remediation.actions:
+        lines.append("  (none)")
+    for action in remediation.actions:
+        label = _ACTION_TYPE_LABELS.get(action.action_type, action.action_type)
+        lines.append(f"  - [{action.column_name}] {label} -- {action.count_affected} value(s): {action.before_example!r} -> {action.after_example!r}")
+        if action.notes:
+            lines.append(f"      note: {action.notes}")
+
+    lines += ["", f"Needs manual review ({len(remediation.manual_review)}):"]
+    if not remediation.manual_review:
+        lines.append("  (none)")
+    for item in remediation.manual_review:
+        lines.append(f"  - [{item.finding.column_name}] {item.finding.issue_type}: {item.reason}")
+
+    return "\n".join(lines)
+
+
 def _rescore_cleaned_dataframe(cleaned_dataframe: pd.DataFrame, table_name: str):
     """
     Re-runs the FULL diagnostic pipeline on the cleaned output, purely so
@@ -1090,8 +1127,23 @@ def render_remediation_section(table_result) -> None:
     a UI choice.
     """
     st.divider()
+    render_html('<div class="mdq-section-title" style="margin-top:0;">🧹 Cleaned Data & Dashboard</div>')
+
+    # Defensive guard: table_result.dataframe / .duplication_result are
+    # only populated by the multi-table pipeline path (see
+    # core/pipeline.py's TableResult) -- if this function is ever reached
+    # from a code path that skipped that (a future refactor, a partially-
+    # constructed test double), fail with a clear, contained message
+    # instead of an AttributeError crashing the whole page.
+    if table_result.dataframe is None or table_result.duplication_result is None:
+        render_html(
+            '<div class="mdq-banner mdq-banner-error">⚠️ Cleaning is unavailable for this table -- '
+            "its original data wasn't carried through to this step. The diagnostic score above is "
+            "still fully valid.</div>"
+        )
+        return
+
     render_html(
-        '<div class="mdq-section-title" style="margin-top:0;">🧹 Cleaned Data & Dashboard</div>'
         '<div class="mdq-banner mdq-banner-warn" style="margin-top:0;">'
         "This is a separate, optional output. The score above is always computed from the "
         "<b>original</b> data -- nothing below it ever changes that score.</div>"
@@ -1151,15 +1203,25 @@ def render_remediation_section(table_result) -> None:
             """
         )
 
-    # -- Download -----------------------------------------------------------
-    csv_bytes = remediation.cleaned_dataframe.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "⬇️ Download cleaned dataset (CSV)",
-        data=csv_bytes,
-        file_name=f"{_safe_filename_stub(table_result.table_name)}_cleaned.csv",
-        mime="text/csv",
-        key=f"download-cleaned-{table_result.table_name}",
-    )
+    # -- Download -------------------------------------------------------------
+    download_cols = st.columns(2)
+    with download_cols[0]:
+        csv_bytes = remediation.cleaned_dataframe.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download cleaned dataset (CSV)",
+            data=csv_bytes,
+            file_name=f"{_safe_filename_stub(table_result.table_name)}_cleaned.csv",
+            mime="text/csv",
+            key=f"download-cleaned-{table_result.table_name}",
+        )
+    with download_cols[1]:
+        st.download_button(
+            "📋 Download audit report (TXT)",
+            data=_audit_report_text(table_result, remediation, intensity_choice),
+            file_name=f"{_safe_filename_stub(table_result.table_name)}_audit_report.txt",
+            mime="text/plain",
+            key=f"download-audit-{table_result.table_name}",
+        )
 
     # -- Dashboard ------------------------------------------------------------
     with st.expander("📊 Dashboard", expanded=False):
@@ -1390,12 +1452,326 @@ def render_empty_state():
     )
 
 
-def render_overall_summary(summary):
-    render_html('<div class="mdq-section-title">📈 Overall Summary</div>')
+def _dimension_bar_row_html(label: str, value: Optional[float]) -> str:
+    """One labelled horizontal bar for the report's per-table dimension
+    breakdown -- value is None for Validity on data scored before that
+    dimension existed (build_scorecard's own backward-compatible
+    default), skipped entirely rather than drawn as a fake zero."""
+    if value is None:
+        return ""
+    tier_alias = _TIER_TOKEN_ALIAS[_score_tier(value)]
+    color = _LIGHT_TOKENS[tier_alias]
+    width = max(0.0, min(100.0, value))
+    return f"""
+    <div class="dim-row">
+      <span class="dim-label">{_html(label)}</span>
+      <div class="dim-track"><div class="dim-fill" style="width:{width:.1f}%;background:{color};"></div></div>
+      <span class="dim-value">{value:.1f}</span>
+    </div>
+    """
 
+
+def _findings_table_html(findings) -> str:
+    """A plain, print-friendly table of every Finding for one table,
+    most-severe first -- the actual substance of the report (every
+    problem this tool found, in one place), not a screenshot of the
+    on-screen collapsible severity groups."""
+    if not findings:
+        return '<p class="no-issues">No issues found in this table.</p>'
+    order = {"critical": 0, "moderate": 1, "minor": 2}
+    ordered = sorted(findings, key=lambda f: order.get(f.severity, 3))
+    rows = []
+    for finding in ordered:
+        meta = SEVERITY_META.get(finding.severity, {"label": finding.severity.title(), "emoji": ""})
+        rows.append(f"""
+        <tr>
+          <td><span class="sev-pill sev-{_html(finding.severity)}">{meta['emoji']} {_html(meta['label'])}</span></td>
+          <td>{_html(finding.column_name)}</td>
+          <td>{_html(finding.display_description)}</td>
+        </tr>
+        """)
+    return f"""
+    <table class="findings-table">
+      <thead><tr><th style="width:110px;">Severity</th><th style="width:160px;">Column</th><th>What was found</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    """
+
+
+def _build_scorecard_report_html(summary) -> str:
+    """
+    The single, professional, self-contained scorecard report -- built
+    ONCE from the exact same MultiTableSummary the on-screen results
+    render from, and used for BOTH the Print button and the Download
+    button (see render_overall_summary), so what a user prints and what
+    they download can never disagree with each other or with what's on
+    screen. This is a genuine report document (title, generated-on date,
+    an overall-score hero, every table's own dimension breakdown, and
+    its full findings table) -- not a screenshot or a plain-text dump of
+    the dashboard chrome.
+
+    Always rendered in the LIGHT palette regardless of the app's current
+    dark-mode toggle -- a printed/downloaded report is meant to be read
+    (and possibly re-printed) outside this session entirely, so it uses
+    literal light-theme hex values (_LIGHT_TOKENS), never a CSS
+    var(--...) reference tied to the live page's current theme, and
+    never depends on st.session_state at all.
+    """
+    t = _LIGHT_TOKENS
+    generated_at = datetime.datetime.now().strftime("%d %b %Y, %I:%M %p")
+    table_names = ", ".join(_html(tr.table_name) for tr in summary.table_results) or "—"
+
+    overall_section = ""
+    per_table_sections = ""
+    if summary.table_results:
+        tier = _score_tier(summary.overall_score)
+        tier_alias = _TIER_TOKEN_ALIAS[tier]
+        emoji, tier_label = _TIER_LABELS[tier]
+
+        counts = {sev: 0 for sev in SEVERITY_META}
+        for finding in summary.combined_findings:
+            counts[finding.severity] += 1
+        chips = "".join(
+            f'<div class="chip chip-{sev}"><span class="chip-num">{counts[sev]}</span>'
+            f'<span class="chip-label">{meta["emoji"]} {_html(meta["label"])}</span></div>'
+            for sev, meta in SEVERITY_META.items()
+        )
+
+        overall_section = f"""
+        <section class="hero">
+          <div class="hero-score" style="color:{t[tier_alias]};">{summary.overall_score:.1f}<span class="hero-of100">/100</span></div>
+          <div class="hero-meta">
+            <div class="tier-pill" style="background:{t[f'{tier_alias}-bg']};color:{t[tier_alias]};border:1px solid {t[f'{tier_alias}-border']};">{emoji} {tier_label}</div>
+            <div class="hero-caption">Average across {len(summary.table_results)} successfully-processed table(s).</div>
+          </div>
+        </section>
+        <section class="chip-row">{chips}</section>
+        """
+
+        for table_result in summary.table_results:
+            scorecard = table_result.scorecard
+            table_tier_alias = _TIER_TOKEN_ALIAS[_score_tier(scorecard.overall_score)]
+            dim_rows = "".join(
+                _dimension_bar_row_html(label, getattr(scorecard, attr_name, None))
+                for attr_name, label, _icon_key, _description in DIMENSION_META
+            )
+            per_table_sections += f"""
+            <section class="table-card">
+              <div class="table-card-header">
+                <div>
+                  <div class="table-card-title">{_html(table_result.table_name)}</div>
+                  <div class="table-card-sub">{table_result.row_count:,} rows &times; {table_result.column_count} columns</div>
+                </div>
+                <div class="table-card-score" style="color:{t[table_tier_alias]};">{scorecard.overall_score:.1f}<span class="hero-of100">/100</span></div>
+              </div>
+              <div class="dim-grid">{dim_rows}</div>
+              {_findings_table_html(table_result.findings)}
+            </section>
+            """
+
+    failures_section = ""
+    if summary.table_failures:
+        failure_rows = "".join(
+            f"<li><b>{_html(f.table_name)}</b>: {_html(f.error_message)}</li>" for f in summary.table_failures
+        )
+        failures_section = f"""
+        <section class="failures">
+          <h2>Tables that could not be processed ({len(summary.table_failures)})</h2>
+          <ul>{failure_rows}</ul>
+        </section>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MSME Data Quality Scorecard</title>
+<style>
+  @page {{ size: A4; margin: 16mm 14mm; }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: {t['text-primary']}; background: #FFFFFF; margin: 0; padding: 0 0 2rem;
+    font-size: 13px; line-height: 1.5;
+  }}
+  .report-header {{
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 1.1rem 1.4rem; border-bottom: 3px solid {t['accent']}; margin-bottom: 1.4rem;
+  }}
+  .report-title {{ font-size: 1.4rem; font-weight: 800; margin: 0; }}
+  .report-subtitle {{ font-size: 0.85rem; color: {t['text-secondary']}; margin-top: .15rem; }}
+  .report-meta {{ text-align: right; font-size: 0.8rem; color: {t['text-secondary']}; }}
+  .report-body {{ padding: 0 1.4rem; }}
+  .report-files {{ font-size: 0.85rem; color: {t['text-secondary']}; margin: -0.6rem 0 1.2rem; }}
+
+  .hero {{ display: flex; align-items: baseline; gap: 1.5rem; margin-bottom: .9rem; }}
+  .hero-score {{ font-size: 3rem; font-weight: 800; line-height: 1; }}
+  .hero-of100 {{ font-size: 1rem; font-weight: 500; opacity: .55; margin-left: .15rem; }}
+  .hero-meta {{ display: flex; flex-direction: column; gap: .3rem; }}
+  .tier-pill {{ display: inline-flex; width: fit-content; align-items: center; gap: .35rem; font-weight: 700; font-size: .85rem; padding: .25rem .7rem; border-radius: 999px; }}
+  .hero-caption {{ font-size: 0.8rem; color: {t['text-secondary']}; }}
+
+  .chip-row {{ display: flex; gap: .6rem; margin-bottom: 1.6rem; }}
+  .chip {{ flex: 1; border-radius: 10px; padding: .55rem .8rem; display: flex; flex-direction: column; gap: .1rem; border: 1px solid {t['border']}; }}
+  .chip-critical {{ background: {t['critical-bg']}; border-color: {t['critical-border']}; }}
+  .chip-moderate {{ background: {t['moderate-bg']}; border-color: {t['moderate-border']}; }}
+  .chip-minor {{ background: {t['minor-bg']}; border-color: {t['minor-border']}; }}
+  .chip-num {{ font-size: 1.3rem; font-weight: 800; }}
+  .chip-label {{ font-size: 0.75rem; color: {t['text-secondary']}; }}
+
+  .table-card {{
+    border: 1px solid {t['border']}; border-radius: 10px; padding: 1rem 1.1rem; margin-bottom: 1.2rem;
+    page-break-inside: avoid;
+  }}
+  .table-card-header {{ display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: .7rem; }}
+  .table-card-title {{ font-size: 1.05rem; font-weight: 700; }}
+  .table-card-sub {{ font-size: 0.78rem; color: {t['text-secondary']}; margin-top: .1rem; }}
+  .table-card-score {{ font-size: 1.5rem; font-weight: 800; }}
+
+  .dim-grid {{ display: flex; flex-direction: column; gap: .35rem; margin-bottom: .9rem; }}
+  .dim-row {{ display: flex; align-items: center; gap: .6rem; }}
+  .dim-label {{ width: 110px; font-size: 0.78rem; color: {t['text-secondary']}; flex-shrink: 0; }}
+  .dim-track {{ flex: 1; height: 7px; border-radius: 4px; background: {t['bg-muted']}; overflow: hidden; }}
+  .dim-fill {{ height: 100%; border-radius: 4px; }}
+  .dim-value {{ width: 34px; text-align: right; font-size: 0.78rem; font-weight: 600; flex-shrink: 0; }}
+
+  .findings-table {{ width: 100%; border-collapse: collapse; font-size: 0.8rem; }}
+  .findings-table th {{
+    text-align: left; padding: .45rem .5rem; background: {t['bg-subtle']};
+    border-bottom: 1px solid {t['border']}; font-size: .72rem; text-transform: uppercase; letter-spacing: .03em; color: {t['text-secondary']};
+  }}
+  .findings-table td {{ padding: .5rem; border-bottom: 1px solid {t['border-subtle']}; vertical-align: top; }}
+  .sev-pill {{ display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .72rem; font-weight: 700; white-space: nowrap; }}
+  .sev-critical {{ background: {t['critical-bg']}; color: {t['critical']}; }}
+  .sev-moderate {{ background: {t['moderate-bg']}; color: {t['moderate']}; }}
+  .sev-minor {{ background: {t['minor-bg']}; color: {t['minor']}; }}
+  .no-issues {{ font-size: 0.85rem; color: {t['text-secondary']}; font-style: italic; }}
+
+  .failures h2 {{ font-size: 1rem; }}
+  .failures li {{ font-size: 0.85rem; margin-bottom: .3rem; }}
+
+  .report-footer {{
+    margin-top: 1.6rem; padding-top: .9rem; border-top: 1px solid {t['border']};
+    font-size: 0.72rem; color: {t['text-tertiary']}; display: flex; justify-content: space-between;
+  }}
+
+  @media print {{
+    body {{ font-size: 11.5px; }}
+    .table-card {{ break-inside: avoid; }}
+  }}
+</style>
+</head>
+<body>
+  <div class="report-header">
+    <div>
+      <div class="report-title">MSME Data Quality Scorecard</div>
+      <div class="report-subtitle">Diagnostic report — completeness, consistency, duplication, structure &amp; validity</div>
+    </div>
+    <div class="report-meta">Generated {generated_at}</div>
+  </div>
+  <div class="report-body">
+    <div class="report-files">Table(s): {table_names}</div>
+    {overall_section}
+    {per_table_sections}
+    {failures_section}
+    <div class="report-footer">
+      <span>100% deterministic scoring — pandas + RapidFuzz rule-based checks, no AI in the score formula. Runs fully offline.</span>
+      <span>MSME Data Quality Scorecard</span>
+    </div>
+  </div>
+</body>
+</html>"""
+
+
+def _render_print_button(report_html: str) -> None:
+    """
+    A real, standalone HTML document rendered via components.html (in
+    its own same-origin iframe), NOT a raw onclick attribute injected
+    through st.markdown's unsafe_allow_html -- content injected that way
+    can have its inline event-handler attributes silently stripped or
+    blocked depending on the browser/host's content-security policy,
+    which is exactly why an earlier version of this button didn't
+    actually respond to clicks. A components.html iframe is parsed as an
+    ordinary HTML page, so its own onclick works like it would on any
+    normal website.
+
+    Prints the EXACT same report_html the Download button saves (see
+    _build_scorecard_report_html) -- opened in a new window and printed
+    from there, not window.print() on the app itself, which would print
+    the dashboard's on-screen chrome (sidebar, upload widget, buttons)
+    instead of a clean report. window.open() is called synchronously
+    inside the real click handler (not after an await/setTimeout), which
+    is what keeps popup blockers from silently swallowing it.
+    """
+    report_json = json.dumps(report_html)
+    components.html(
+        f"""
+        <div style="margin:0;padding:0;">
+          <button id="mdq-print-btn"
+            title="Opens the full scorecard report and the print dialog -- choose &quot;Save as PDF&quot; there to download a PDF"
+            style="
+              width:100%; height:2.5rem; padding:0 0.6rem; border-radius:8px; box-sizing:border-box;
+              border:1px solid {_LIGHT_TOKENS['border']}; background:{_LIGHT_TOKENS['bg-elevated']}; color:{_LIGHT_TOKENS['text-primary']};
+              font-size:0.95rem; font-weight:500; cursor:pointer; white-space:nowrap; font-family:sans-serif;
+            "
+            onmouseover="this.style.borderColor='{_LIGHT_TOKENS['accent']}';"
+            onmouseout="this.style.borderColor='{_LIGHT_TOKENS['border']}';"
+          >🖨️ Print</button>
+        </div>
+        <script>
+          document.getElementById('mdq-print-btn').addEventListener('click', function () {{
+            var reportHtml = {report_json};
+            var reportWindow = window.open('', '_blank');
+            if (!reportWindow) {{ return; }}
+            reportWindow.document.open();
+            reportWindow.document.write(reportHtml);
+            reportWindow.document.close();
+            reportWindow.focus();
+            setTimeout(function () {{ reportWindow.print(); }}, 300);
+          }});
+        </script>
+        """,
+        height=42,
+    )
+
+
+def render_overall_summary(summary):
     if not summary.table_results and not summary.table_failures:
+        render_html('<div class="mdq-section-title">📈 Overall Summary</div>')
         st.info("No tables processed yet.")
         return
+
+    # Top-right corner toolbar: Print and Download both output the exact
+    # SAME professional scorecard report (see _build_scorecard_report_html)
+    # -- built once, here, and handed to both. Print opens it in a new
+    # window and triggers the browser's print dialog there (save as PDF
+    # from that dialog); Download saves the identical HTML report
+    # directly. Neither is a screenshot of this dashboard -- both are the
+    # same standalone report document. All three cells share the SAME
+    # fixed height (2.5rem) and zero top margin so they line up on one
+    # row regardless of each widget's own default spacing (a native
+    # st.download_button and a plain text heading don't share the same
+    # intrinsic box height otherwise).
+    report_html = _build_scorecard_report_html(summary)
+    title_col, print_col, download_col = st.columns([5, 1.3, 1.5])
+    with title_col:
+        render_html(
+            '<div style="display:flex;align-items:center;height:2.5rem;">'
+            '<div class="mdq-section-title" style="margin:0;">📈 Overall Summary</div>'
+            "</div>"
+        )
+    with print_col:
+        _render_print_button(report_html)
+    with download_col:
+        st.download_button(
+            "⬇️ Download",
+            data=report_html,
+            file_name="msme_data_quality_scorecard.html",
+            mime="text/html",
+            key="download_scorecard_report",
+            help="Download the full scorecard report (overall score, per-table breakdown, every issue found) as an HTML file -- open it in any browser and print or save as PDF from there.",
+            use_container_width=True,
+        )
 
     if summary.table_results:
         tier = _score_tier(summary.overall_score)

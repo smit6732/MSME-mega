@@ -123,11 +123,22 @@ _DOMINANT_CASE_SHARE_THRESHOLD = 0.8
 # _guarded_clean_numeric) rather than just discard them blindly.
 _CURRENCY_AND_WHITESPACE = re.compile(r"[₹$€£\s]")
 
-# A simple 3-part, all-digit date, split on the usual separators. Any
-# date that doesn't look like this (a month name, a 2-part date, extra
+# A simple 3-part date, split on the usual separators, digits or a
+# recognized month name in one slot. Anything else (a 2-part date, extra
 # junk) is left alone -- normalizing it would require guessing at a
 # format we have no evidence for.
-_DATE_SEPARATOR = re.compile(r"[\-/.]")
+_DATE_SEPARATOR = re.compile(r"[\-/. ,]+")
+
+# A month NAME (unlike a bare number) removes all day/month ambiguity by
+# itself -- "15-Jan-2020" can only mean one thing, unlike "15-01-2020"
+# vs "01-15-2020". Safe to normalize unconditionally once one part
+# matches this table.
+_MONTH_NAME_TO_NUMBER = {
+    "jan": 1, "january": 1, "feb": 2, "february": 2, "mar": 3, "march": 3,
+    "apr": 4, "april": 4, "may": 5, "jun": 6, "june": 6, "jul": 7, "july": 7,
+    "aug": 8, "august": 8, "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10, "nov": 11, "november": 11, "dec": 12, "december": 12,
+}
 
 
 @dataclass
@@ -273,8 +284,11 @@ def _guarded_normalize_date(raw_value: str) -> Optional[str]:
         return None
 
     parts = _DATE_SEPARATOR.split(text)
-    if len(parts) != 3 or not all(part.isdigit() for part in parts):
-        return None  # not a plain 3-part numeric date -- e.g. "15-Jan-2020"
+    if len(parts) != 3:
+        return None
+
+    if not all(part.isdigit() for part in parts):
+        return _guarded_normalize_month_name_date(parts)
 
     year_positions = [i for i, part in enumerate(parts) if len(part) == 4]
     if len(year_positions) != 1:
@@ -306,6 +320,44 @@ def _guarded_normalize_date(raw_value: str) -> Optional[str]:
         return None
 
     return f"{year}-{month:02d}-{day:02d}"
+
+
+def _guarded_normalize_month_name_date(parts: List[str]) -> Optional[str]:
+    """
+    Handles the DD-Mon-YYYY / Mon-DD-YYYY family (e.g. "15-Jan-2020",
+    "Jan 15 2020") -- exactly one of the three parts must be a
+    recognized month NAME (see _MONTH_NAME_TO_NUMBER); the other two
+    must be plain digits, with exactly one of them 4 digits (the year).
+    A month name resolves the day/month order question completely by
+    itself, so -- unlike the all-numeric case -- there is no ambiguous
+    variant here to decline: either it unambiguously matches this shape,
+    or it's declined as not a format this function recognizes.
+    """
+    month_number, month_position = None, None
+    for index, part in enumerate(parts):
+        number = _MONTH_NAME_TO_NUMBER.get(part.strip(".").lower())
+        if number is not None:
+            month_number, month_position = number, index
+            break
+    if month_number is None:
+        return None  # not a month-name date either -- decline, don't guess
+
+    other_parts = [part for index, part in enumerate(parts) if index != month_position]
+    if not all(part.isdigit() for part in other_parts):
+        return None
+
+    year_candidates = [part for part in other_parts if len(part) == 4]
+    if len(year_candidates) != 1:
+        return None
+    year = year_candidates[0]
+    day_candidates = [part for part in other_parts if part != year]
+    if len(day_candidates) != 1:
+        return None
+    day = int(day_candidates[0])
+    if not (1 <= day <= 31):
+        return None
+
+    return f"{year}-{month_number:02d}-{day:02d}"
 
 
 # ---- Per-Finding dispatch ----------------------------------------------------
@@ -704,6 +756,10 @@ def _apply_domain_outlier_fix(dataframe, finding, config: CleaningConfig, action
     details = finding.details or {}
     allowed_set = set(details["allowed_set"]) if details.get("allowed_set") is not None else None
     lower_bound, upper_bound = details.get("lower_bound"), details.get("upper_bound")
+    # min_exclusive: core/validity.py's own detection already reused this
+    # exact flag (e.g. a Quantity of exactly 0, not just negative, is a
+    # violation) -- reused here verbatim, never re-derived.
+    min_exclusive = bool(details.get("min_exclusive", False))
     if allowed_set is None and lower_bound is None and upper_bound is None:
         manual_review.append(ManualReviewItem(
             finding, "This column's safe numeric bounds couldn't be determined -- needs manual review.",
@@ -727,12 +783,24 @@ def _apply_domain_outlier_fix(dataframe, finding, config: CleaningConfig, action
         if allowed_set is not None:
             violates = value not in allowed_set
         else:
-            violates = (lower_bound is not None and value < lower_bound) or (upper_bound is not None and value > upper_bound)
+            below_lower = lower_bound is not None and (value <= lower_bound if min_exclusive else value < lower_bound)
+            violates = below_lower or (upper_bound is not None and value > upper_bound)
         if not violates:
             continue
 
         if clip_mode:
-            if lower_bound is not None and value < lower_bound:
+            if lower_bound is not None and below_lower and min_exclusive:
+                # "Clip to the boundary" is meaningless for an exclusive
+                # bound (a Quantity of exactly 0 is still invalid after
+                # clipping to 0) -- blank it instead of guessing what
+                # the smallest legal value should be.
+                new_text = "(blank)"
+                dataframe.at[row_index, column] = None
+                changed_count += 1
+                if before_example is None:
+                    before_example, after_example = raw_text, new_text
+                continue
+            if lower_bound is not None and below_lower:
                 new_value = lower_bound
             else:
                 new_value = upper_bound

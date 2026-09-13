@@ -1,5 +1,129 @@
 # Upgrade notes: Validity dimension + real cleaning capability
 
+## Pass 4: final polish -- residual typos, rating/quantity/amount bounds, dates
+
+- **`core/validity.py`**: the fuzzy-typo cardinality guard was gated on
+  a distinct/row-count RATIO, which wrongly declined genuinely
+  categorical columns (City, with many real cities in a small file) --
+  e.g. `Chennnai` next to a handful of real distinct cities was never
+  reached. Replaced with the real distinguishing signal: fuzzy matching
+  is eligible whenever at least one key is genuinely REPEATED (an
+  established "house style" exists to match against), regardless of how
+  many total distinct categories the column has. Free text (every value
+  unique, nothing repeats -- e.g. Business_Name) is still correctly
+  declined, re-verified by its existing test.
+- **`core/validity.py`**: added a `customer_rating` named rule (1-5),
+  checked before the generic `rating` rule (0-10) so a specifically-
+  named Customer_Rating column gets the tighter, more accurate bound.
+- **`core/validity.py` / `core/remediation.py`**: Quantity/Qty now
+  reject exactly 0 as well as negative (`min_exclusive`) -- an order
+  line can't have zero items. The flag is carried end-to-end through
+  `Finding.details` and reused verbatim by remediation, never
+  re-derived. Price/Amount/Total_Amount stay at plain "can't be
+  negative" (a zero price/amount can be legitimately valid).
+- **`core/validity.py`**: Total_Amount/Price now also get the
+  statistical IQR extreme-outlier check (same reasoning as Quantity --
+  these are transaction-scoped within one file, unlike Revenue/Salary/
+  Cost which legitimately vary widely across businesses and stay
+  IQR-free to avoid false positives).
+- **`core/remediation.py`**: date normalization now also splits on `,`
+  (`"Jan 20, 2020"`) in addition to the existing separators.
+- 4 new tests (74 total).
+- Live-verified: `Chennnai`->`Chennai`, `Customer_Rating=9` and
+  `Quantity=0`/`-1` neutralized, `Total_Amount=999999` neutralized,
+  `Jan 20, 2020` / `2020.04.12` normalized, genuinely ambiguous dates
+  (`10-03-2020`, `03-04-2020`) correctly left on manual review.
+
+## Pass 3: curated alias dictionary, quantity outliers, month-name dates
+
+Makes categorical standardization "genuinely strong" per the Priority 1
+gap, plus two smaller outlier/date fixes:
+
+- **`core/validity.py`**: added a curated, hand-authored alias
+  dictionary (`_KNOWN_CATEGORICAL_ALIASES` / `_CONDITIONAL_CATEGORICAL_ALIASES`)
+  for abbreviations and city-name synonyms a similarity score can never
+  safely catch on its own (`DC`->`Debit Card`, `NB`->`Net Banking`,
+  `CC`->`Credit Card`, `COD`->`Cash on Delivery`, `Dilli`->`Delhi`,
+  `Madras`->`Chennai`, `Bengaluru`->`Bangalore`, `Bombay`->`Mumbai`,
+  `Calcutta`->`Kolkata`, `Deliverd`->`Delivered`). `New Delhi`->`Delhi`
+  is conditional: it only fires when the column's own dominant spelling
+  is already `Delhi`, so a dataset that deliberately distinguishes the
+  two isn't silently merged. The existing cardinality guard (which stops
+  fuzzy matching from misfiring on genuine free-text columns) now only
+  gates the STATISTICAL half of categorical detection -- the curated
+  alias lookup runs regardless, so a column like City (naturally many
+  distinct real values even in a small file) still gets its known
+  aliases fixed.
+- **`core/validity.py`**: `Quantity`/`Qty`/`Count`-shaped columns now
+  also get the statistical IQR extreme-outlier check on top of their
+  non-negative bound (catches a Quantity of 999/5000 among mostly
+  single-digit orders). Deliberately NOT extended to
+  Price/Amount/Revenue/Salary/Cost/... -- those vary legitimately over a
+  wide, business-dependent range, so flagging them by statistical
+  extremity alone would be a real false-positive risk (verified via a
+  new test: a genuinely high but legitimate Annual_Revenue value is
+  NOT flagged).
+- **`core/remediation.py`**: unambiguous month-name dates (`15-Jan-2020`,
+  `3 Feb 2021`) now normalize to `YYYY-MM-DD` -- previously only plain
+  all-numeric dates were handled. A month NAME removes the day/month
+  ambiguity entirely (unlike an all-numeric date), so there's no
+  ambiguous case to decline here.
+- 4 new tests (70 total): known-alias mapping, the conditional
+  `New Delhi` guard, month-name date normalization, and
+  Quantity-extreme-vs-Revenue-not-flagged.
+- Live-verified against a synthetic messy orders file covering every
+  named success criterion: `Deliverd`->`Delivered`, `DC`/`NB`/`CC`->full
+  payment-method names, `Dilli`/`Madras`/`Bengaluru`->`Delhi`/`Chennai`/
+  `Bangalore`, `ask` in a date column and `unknown` in a numeric column
+  cleared to blank, `Rating=150` and `Total_Amount=-200` neutralized,
+  exact duplicate row removed, mixed DD-Mon-YYYY/YYYY-MM-DD dates
+  normalized, no crash, no auto-push.
+
+CATEGORICAL_FUZZY_THRESHOLD stays at 85 (Jaro-Winkler scale), not 88 --
+see that constant's docstring: 88 on this scale would drop the
+project's own named "Dizel"->"Diesel" example (scores 85.8) below the
+floor. 88 is correct on rapidfuzz's WRatio scale, which this project
+deliberately does not use (see Pass 2/1 notes below for why).
+
+## Pass 2: transactional-data false positives, defensive UI, audit report
+
+Fixes two real false-positive bugs found on order/transaction-style data
+(e.g. a `Customer_ID`/`Customer_Name` that legitimately repeats across
+many different orders), plus Phase 5/6 polish:
+
+- **`core/structure.py`**: `IDENTIFIER_COLUMN_NAME_HINTS` used to match a
+  bare `_id` substring, so `Customer_ID` was flagged as "should be a
+  unique identifier" even in normal order data. Now a column only counts
+  as a per-row identifier if it names an actual transaction key
+  (`Order_ID`, `Invoice_ID`, `GST`, ...) or a bare `_id`/`code` hint that
+  does NOT also look like a dimension reference (`customer`, `vendor`,
+  `product`, `employee`, ...). `Order_ID` repeating is still caught;
+  `Customer_ID` repeating no longer is.
+- **`core/duplication.py`**: a pair whose identity-column value is an
+  EXACT match (not a fuzzy near-miss) is now only counted as a
+  near-duplicate RECORD if enough of the *rest* of the row also matches
+  (`_confirm_exact_identity_match`, floor 50%) -- otherwise it's just a
+  repeat customer on a different order, not a duplicated entry. A
+  genuine spelling variant (`Shree Ganesh` vs `Shri Ganesh`) is
+  unaffected -- that check only applies to essentially-identical values.
+- **`core/validity.py`**: added named domain rules for `Rating` (0-10)
+  and `Discount`/`Discount_Percent` (0-100, documented as a percentage
+  assumption).
+- **`app.py`**: `render_remediation_section` now guards against
+  `table_result.dataframe`/`.duplication_result` being `None` (shows a
+  contained message instead of an `AttributeError`). Added a "Download
+  audit report (TXT)" button alongside the cleaned-CSV download, built
+  from the same `RemediationResult` the on-screen log renders from.
+- 5 new tests (66 total): repeating `Customer_ID`/`Customer_Name` no
+  longer false-positives, `Order_ID` duplication still caught, a real
+  near-duplicate business-name pair (matching row) still caught,
+  Rating/Discount domain-outlier detection.
+- Live-verified against a synthetic orders file
+  (`Order_ID`/`Customer_ID`/`Customer_Name`/`Rating`/`Discount_Percent`):
+  0 false criticals, Duplication/Structure both 100.0, real outliers
+  (`Rating=150`, `Amount=-200`) correctly caught and cleared.
+
+
 This upgrade extends the existing Data Quality Scorecard / Tier 1 cleaning
 pipeline with a 5th scorecard dimension (**Validity**) and a much more
 capable, still-conservative-by-default `core/remediation.py`. It is an

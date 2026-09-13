@@ -15,6 +15,19 @@ Two different problems live under "duplication":
 No ML anomaly detection here by design -- just pandas' exact-match check
 plus rapidfuzz string similarity, per this project's scope.
 
+Row-level confirmation for EXACT identity matches: two rows sharing the
+EXACT same identity-column value (e.g. the same Customer_Name) are only
+counted as a fuzzy-duplicate PAIR if enough of the rest of the row also
+matches -- otherwise this is a normal repeat entity (the same customer
+placing several different orders), not a duplicated record. A near-but-
+not-identical identity match (a genuine spelling variant, e.g. "Shree
+Ganesh" vs "Shri Ganesh") is NOT subject to this extra check -- that's
+squarely what fuzzy matching exists to catch. See
+_confirm_exact_identity_match's docstring for the exact rule. This is
+the fix for a documented false-positive: transactional/order data where
+the same Customer_ID/Customer_Name legitimately repeats across many
+different orders was being reported as "near-duplicate records".
+
 Adaptive threshold: instead of always requiring a fixed 90% similarity
 score to call two names a likely duplicate, we compute EVERY pairwise
 similarity score for this table's identity column first, then hand that
@@ -68,6 +81,21 @@ IDENTITY_COLUMN_NAME_HINTS = ["business_name", "company_name", "vendor_name", "n
 # are grouped into cheap "blocks" first (see _blocking_key) so the
 # comparison volume doesn't grow as the full square of the row count.
 BLOCKING_ROW_COUNT_THRESHOLD = 800
+
+# A pair whose identity-column similarity is at or above this is treated
+# as an EXACT match for the row-level-confirmation rule below (not just
+# a literal 100.0 -- rapidfuzz can report 99.9x on values that are
+# whitespace-identical after normalization).
+_EXACT_IDENTITY_SIMILARITY_FLOOR = 99.5
+
+# For an exact-identity pair, the minimum share of the row's OTHER
+# columns that must also match before it's trusted as a genuine
+# duplicated record rather than a normal repeat entity (see module
+# docstring). Deliberately not "all other columns" -- a real duplicate
+# entry commonly still differs in a timestamp/auto-increment column --
+# but a bare majority is the "confident, not a coin flip" bar this
+# project holds every auto-detection to.
+_ROW_SIMILARITY_FLOOR_FOR_EXACT_IDENTITY = 0.5
 
 # How many characters of a row's "sorted words" signature to use as its
 # block key. Short enough that a genuine near-duplicate (a typo, extra
@@ -240,7 +268,7 @@ def check_duplication(dataframe: pd.DataFrame, column_types: Dict[str, str]) -> 
     # nothing to compare them against.
     calibration = calibrate_duplicate_threshold(all_similarity_scores)
 
-    fuzzy_pairs = _extract_matching_pairs(scored_blocks, calibration.value)
+    fuzzy_pairs = _extract_matching_pairs(scored_blocks, calibration.value, dataframe, identity_column)
 
     # A row "counts" toward the duplicate percentage if it's an exact
     # duplicate, or it appears on either side of a fuzzy-duplicate pair.
@@ -263,8 +291,36 @@ def check_duplication(dataframe: pd.DataFrame, column_types: Dict[str, str]) -> 
     )
 
 
+def _confirm_exact_identity_match(dataframe: pd.DataFrame, index_a: int, index_b: int, identity_column: str) -> bool:
+    """
+    For a pair whose identity-column values are (essentially) identical:
+    True only when enough of the REST of the row also matches to trust
+    this as a genuine duplicated record, not just two different rows
+    that happen to share a repeating dimension value (the same customer
+    across two different orders, the same product across two different
+    line items). See module docstring for the failure mode this fixes.
+    Compared as stripped, lowercased strings -- the same normalization
+    core/consistency.py's own dominant-variant check uses -- so a pure
+    casing/whitespace difference in another column still counts as "the
+    same value" here (that's a formatting problem, not evidence these
+    are different real-world records).
+    """
+    other_columns = [c for c in dataframe.columns if c != identity_column]
+    if not other_columns:
+        return True  # nothing else to compare -- fall back to trusting the identity match alone
+    row_a, row_b = dataframe.loc[index_a], dataframe.loc[index_b]
+    matches = sum(
+        str(row_a[c]).strip().lower() == str(row_b[c]).strip().lower()
+        for c in other_columns
+    )
+    return (matches / len(other_columns)) >= _ROW_SIMILARITY_FLOOR_FOR_EXACT_IDENTITY
+
+
 def _extract_matching_pairs(
-    scored_blocks: List[Tuple[List[Tuple[int, str]], np.ndarray]], threshold: float
+    scored_blocks: List[Tuple[List[Tuple[int, str]], np.ndarray]],
+    threshold: float,
+    dataframe: pd.DataFrame,
+    identity_column: Optional[str],
 ) -> List[FuzzyDuplicatePair]:
     """
     Turns each block's similarity matrix into actual FuzzyDuplicatePair
@@ -274,6 +330,13 @@ def _extract_matching_pairs(
     pairs: by this point numpy has already narrowed things down to just
     the matches (via the boolean comparison + np.where below), so this
     loop runs a handful of times, not n^2 times.
+
+    A pair whose identity-column similarity is essentially exact (see
+    _EXACT_IDENTITY_SIMILARITY_FLOOR) gets one more check --
+    _confirm_exact_identity_match -- before being trusted as a real
+    duplicate; a near-but-not-identical match (a genuine spelling
+    variant) skips that check entirely, since that's squarely what
+    fuzzy matching is for.
     """
     fuzzy_pairs: List[FuzzyDuplicatePair] = []
     for block, matrix in scored_blocks:
@@ -285,11 +348,17 @@ def _extract_matching_pairs(
             i, j = upper_i[position], upper_j[position]
             index_a, value_a = block[i]
             index_b, value_b = block[j]
+            score = float(scores[position])
+
+            if identity_column is not None and score >= _EXACT_IDENTITY_SIMILARITY_FLOOR:
+                if not _confirm_exact_identity_match(dataframe, index_a, index_b, identity_column):
+                    continue
+
             fuzzy_pairs.append(FuzzyDuplicatePair(
                 row_index_a=index_a,
                 row_index_b=index_b,
                 value_a=value_a,
                 value_b=value_b,
-                similarity_score=round(float(scores[position]), 2),
+                similarity_score=round(score, 2),
             ))
     return fuzzy_pairs

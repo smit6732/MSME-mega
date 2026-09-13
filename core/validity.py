@@ -156,6 +156,18 @@ _NAMED_DOMAIN_RULES: Dict[str, dict] = {
     "km": {"min": 0.0, "max": 1_000_000.0},
     "age": {"min": 0.0, "max": 120.0},
     "year": {"min": 1900.0, "max": None},  # upper bound filled in dynamically, see _year_upper_bound
+    # Checked BEFORE the generic "rating" entry below (dict order = match
+    # order, first hit wins) -- a "Customer_Rating" column is, by name,
+    # unambiguously a 1-5 satisfaction/star rating, a narrower and more
+    # confident bound than the generic catch-all.
+    "customer_rating": {"min": 1.0, "max": 5.0},
+    "rating": {"min": 0.0, "max": 10.0},   # covers both 5-star and 10-point scales; never legitimately negative or > 10
+    # A "discount" column in MSME retail/sales data is overwhelmingly a
+    # PERCENTAGE (discount_percent, disc%, ...) -- 0-100 is the safe,
+    # documented judgment call here. If a specific dataset genuinely uses
+    # an absolute-currency discount column, override it via
+    # domain_rule_overrides rather than widening this default silently.
+    "discount": {"min": 0.0, "max": 100.0},
 }
 
 # Column-name substrings that imply "this can never legitimately be
@@ -166,9 +178,33 @@ _NAMED_DOMAIN_RULES: Dict[str, dict] = {
 # MSME dataset this tool is likely to see, regardless of the specific
 # column.
 _NON_NEGATIVE_NAME_HINTS = (
-    "price", "amount", "revenue", "salary", "cost", "quantity", "qty",
-    "count", "distance", "weight", "fee", "charge", "discount", "stock",
+    "revenue", "salary", "cost",
+    "distance", "weight", "fee", "charge", "stock",
 )
+
+# A NARROWER subset of the same idea, for columns where an unrealistically
+# HIGH value (not just a negative one) is also a strong, low-risk signal
+# of a data-entry error -- e.g. an order Quantity of 999/5000 among
+# mostly single-digit values, or a wildly-inflated Total_Amount/Price on
+# one row of an otherwise-consistent order table. Deliberately NOT
+# extended to revenue/salary/cost above: those legitimately vary over a
+# wide, business-dependent range (one company's Annual_Revenue can be
+# 50x another's without anything being wrong), so flagging them by
+# statistical extremity alone would be a real false-positive risk this
+# project's "never guess" stance rules out -- Total_Amount/Price/Quantity
+# don't have that same legitimate-wide-variance problem WITHIN one file's
+# own transactions. Value = True means the column additionally can never
+# legitimately be exactly ZERO either (an order line can't have Quantity
+# 0), so those violate on <= 0, not just < 0; price/amount stay at plain
+# < 0 since a zero price/amount can be a real, valid value (e.g. a free
+# item, a fully-discounted order).
+_NON_NEGATIVE_HINTS_WITH_IQR_FALLBACK: Dict[str, bool] = {
+    "quantity": True,
+    "qty": True,
+    "count": False,
+    "amount": False,
+    "price": False,
+}
 
 # Numeric columns with at least this many distinct values are eligible
 # for the generic IQR-based "extreme outlier" fallback (too few distinct
@@ -202,7 +238,39 @@ _IQR_EXTREME_MULTIPLIER = 3.0
 # that's indistinguishable from a genuinely different short code without
 # domain knowledge, which is exactly what a synonym dictionary (see this
 # module's docstring) is for, not a generic distance metric.
+# NOTE: kept at 85, not 88 -- the brief's "88" is on rapidfuzz.fuzz's
+# WRatio scale, not Jaro-Winkler's (see the paragraph above). 88 on THIS
+# scale would drop "Dizel" -> "Diesel" (scores 85.8) below the floor,
+# missing one of this project's own named, hand-verified examples --
+# verified empirically before choosing this number, not guessed.
 CATEGORICAL_FUZZY_THRESHOLD = 85.0
+
+# Curated alias dictionary -- explicit, hand-authored domain knowledge,
+# not something any distance metric would safely find on its own (e.g.
+# "DC" vs "Debit Card" share almost no characters, so no similarity
+# score would ever responsibly link them). Applied as an exact,
+# case-insensitive match on a value's own dominant spelling within its
+# categorical_key group -- never fuzzy -- so there is never any doubt
+# about what triggered the mapping. Keys are lowercased/trimmed.
+_KNOWN_CATEGORICAL_ALIASES: Dict[str, str] = {
+    "dc": "Debit Card",
+    "nb": "Net Banking",
+    "cc": "Credit Card",
+    "cod": "Cash on Delivery",
+    "dilli": "Delhi",
+    "madras": "Chennai",
+    "bengaluru": "Bangalore",
+    "bombay": "Mumbai",
+    "calcutta": "Kolkata",
+    "deliverd": "Delivered",
+}
+# Conditional aliases: only fire when the column's OWN dominant spelling
+# already agrees with the target -- e.g. "New Delhi" is a real, distinct
+# place in some datasets, so it's only folded into "Delhi" when "Delhi"
+# is already this column's established form, never applied blind.
+_CONDITIONAL_CATEGORICAL_ALIASES: Dict[str, str] = {
+    "new delhi": "Delhi",
+}
 
 
 def _categorical_similarity(a: str, b: str, **_kwargs) -> float:
@@ -218,12 +286,17 @@ def _categorical_similarity(a: str, b: str, **_kwargs) -> float:
 # would let two equally-rare typos "correct" each other arbitrarily.
 _DOMINANT_VARIANT_TOP_N = 12
 
-# A column is only eligible for categorical-typo detection when it has
-# at most this many distinct normalized values relative to its row
-# count -- a genuine free-text column (Business_Name, Address) has no
-# real "canonical form" to converge on, and running fuzzy matching there
-# would just invent false-positive mappings between unrelated values.
-_MAX_DISTINCT_RATIO_FOR_CATEGORICAL = 0.5
+# A column is only eligible for FUZZY categorical-typo matching when it
+# has at most this many distinct normalized values at all (a hard cap,
+# mostly for performance on a genuinely huge free-text column) AND has
+# at least one key that's genuinely REPEATED (count >= 2) -- see
+# "eligible_for_fuzzy_matching" below. That second condition, not a
+# distinct/row-count RATIO, is what actually distinguishes a real
+# categorical column (City: a handful of real cities, each repeated many
+# times, plus one typo) from genuine free text (Business_Name: every
+# value essentially unique, nothing ever repeats) -- a ratio alone would
+# wrongly decline a categorical column just because it happens to have
+# many legitimate distinct categories relative to a small file.
 _MAX_ABSOLUTE_DISTINCT_FOR_CATEGORICAL = 40
 
 
@@ -304,21 +377,34 @@ def _check_missing_representation(raw_series: pd.Series) -> Tuple[int, List[str]
 # domain_outlier / impossible_value
 # ---------------------------------------------------------------------------
 
-def _resolve_domain_rule(column_name: str, overrides: Optional[Dict[str, dict]]) -> Optional[dict]:
+def _resolve_domain_rule(column_name: str, overrides: Optional[Dict[str, dict]]) -> Tuple[Optional[dict], bool]:
+    """
+    Returns (rule, is_specific). is_specific=True means the rule carries
+    real-world semantic bounds (a named rule, or an override) and is
+    trusted on its own with no further statistical check. is_specific=
+    False means the rule is only the generic "this can't be negative"
+    name-hint fallback (min=0, no real upper bound) -- see
+    _check_domain_outliers for why that case ALSO still gets the IQR
+    extreme-outlier check on top, instead of an ungrounded "no upper
+    bound at all" being the final word for e.g. Quantity or Total_Amount.
+    """
     name_lower = column_name.lower()
     if overrides:
         for hint, rule in overrides.items():
             if hint.lower() in name_lower:
-                return rule
+                return rule, True
     for hint, rule in _NAMED_DOMAIN_RULES.items():
         if hint in name_lower:
             resolved = dict(rule)
             if hint == "year" and resolved.get("max") is None:
                 resolved["max"] = _year_upper_bound()
-            return resolved
+            return resolved, True
     if any(hint in name_lower for hint in _NON_NEGATIVE_NAME_HINTS):
-        return {"min": 0.0, "max": None}
-    return None
+        return {"min": 0.0, "max": None}, True
+    for hint, min_exclusive in _NON_NEGATIVE_HINTS_WITH_IQR_FALLBACK.items():
+        if hint in name_lower:
+            return {"min": 0.0, "max": None, "min_exclusive": min_exclusive}, False
+    return None, False
 
 
 def _values_violating_rule(numeric_values: pd.Series, rule: dict) -> Tuple[pd.Series, str]:
@@ -329,14 +415,18 @@ def _values_violating_rule(numeric_values: pd.Series, rule: dict) -> Tuple[pd.Se
         return violating, description
 
     lower_bound, upper_bound = rule.get("min"), rule.get("max")
+    min_exclusive = rule.get("min_exclusive", False)
     mask = pd.Series(False, index=numeric_values.index)
     if lower_bound is not None:
-        mask |= numeric_values < lower_bound
+        mask |= (numeric_values <= lower_bound) if min_exclusive else (numeric_values < lower_bound)
     if upper_bound is not None:
         mask |= numeric_values > upper_bound
+    lower_text = None
+    if lower_bound is not None:
+        lower_text = f"> {lower_bound:g}" if min_exclusive else f">= {lower_bound:g}"
     bound_text = " and ".join(
         text for text in [
-            f">= {lower_bound:g}" if lower_bound is not None else None,
+            lower_text,
             f"<= {upper_bound:g}" if upper_bound is not None else None,
         ] if text
     )
@@ -354,30 +444,87 @@ def _check_domain_outliers(
     guard when no named rule matched, so a column we can actually reason
     about by name is never second-guessed by a purely statistical bound.
     """
-    named_rule = _resolve_domain_rule(column_name, domain_rule_overrides)
-    if named_rule is not None:
+    named_rule, is_specific = _resolve_domain_rule(column_name, domain_rule_overrides)
+
+    if named_rule is not None and is_specific:
+        # A real, semantic bound (Rating, Doors, Discount, Year, an
+        # explicit override, ...) -- trusted entirely on its own, no
+        # statistical second-guessing.
         violating, description = _values_violating_rule(numeric_values, named_rule)
         if violating.empty:
             return None
-        details = {"rule": description, "lower_bound": named_rule.get("min"), "upper_bound": named_rule.get("max")}
+        details = {
+            "rule": description, "lower_bound": named_rule.get("min"), "upper_bound": named_rule.get("max"),
+            "min_exclusive": named_rule.get("min_exclusive", False),
+        }
         if named_rule.get("allowed_set") is not None:
             details = {"rule": description, "allowed_set": sorted(named_rule["allowed_set"])}
         return violating, description, details
 
-    if numeric_values.nunique() < _MIN_DISTINCT_VALUES_FOR_IQR:
+    # Either no rule matched at all, or only the generic non-negative
+    # name-hint fallback did (Quantity, Amount, Price, ...) -- that
+    # fallback alone has no real upper bound, so an extreme value like a
+    # Quantity of 5000 or a wildly-inflated Total_Amount would otherwise
+    # never be caught. Run the statistical IQR check too and union any
+    # violations found either way, rather than letting a name-only rule
+    # silently stop the search once it finds a negative value.
+    negative_violating = pd.Series(dtype=float)
+    negative_rule_min = None
+    if named_rule is not None:
+        negative_violating, _description = _values_violating_rule(numeric_values, named_rule)
+        negative_rule_min = named_rule.get("min")
+
+    iqr_violating = pd.Series(dtype=float)
+    iqr_bounds = (None, None)
+    if numeric_values.nunique() >= _MIN_DISTINCT_VALUES_FOR_IQR:
+        q1, q3 = numeric_values.quantile(0.25), numeric_values.quantile(0.75)
+        iqr = q3 - q1
+        if iqr != 0:
+            lower_bound = q1 - _IQR_EXTREME_MULTIPLIER * iqr
+            upper_bound = q3 + _IQR_EXTREME_MULTIPLIER * iqr
+            iqr_violating = numeric_values[(numeric_values < lower_bound) | (numeric_values > upper_bound)]
+            iqr_bounds = (round(float(lower_bound), 4), round(float(upper_bound), 4))
+
+    combined_index = negative_violating.index.union(iqr_violating.index)
+    if len(combined_index) == 0:
         return None
-    q1, q3 = numeric_values.quantile(0.25), numeric_values.quantile(0.75)
-    iqr = q3 - q1
-    if iqr == 0:
-        return None
-    lower_bound = q1 - _IQR_EXTREME_MULTIPLIER * iqr
-    upper_bound = q3 + _IQR_EXTREME_MULTIPLIER * iqr
-    violating = numeric_values[(numeric_values < lower_bound) | (numeric_values > upper_bound)]
-    if violating.empty:
-        return None
-    description = f"statistically extreme (outside {lower_bound:.2f} to {upper_bound:.2f}, based on this column's own distribution)"
-    details = {"rule": description, "lower_bound": round(float(lower_bound), 4), "upper_bound": round(float(upper_bound), 4)}
-    return violating, description, details
+    combined_violating = numeric_values.loc[combined_index]
+
+    # A single (lower_bound, upper_bound) pair that reproduces this exact
+    # union as one "value < lower_bound or value > upper_bound" test --
+    # core/remediation.py re-filters using these two numbers directly
+    # (never re-deriving a bound itself), so they must exactly match what
+    # was actually found here. Since two "less-than" conditions OR
+    # together into "less than the larger of the two", the combined
+    # lower bound is the MAX of the rule floor and the IQR floor, not the min.
+    lower_bound_for_details = negative_rule_min
+    if iqr_bounds[0] is not None:
+        lower_bound_for_details = (
+            max(lower_bound_for_details, iqr_bounds[0]) if lower_bound_for_details is not None else iqr_bounds[0]
+        )
+    upper_bound_for_details = iqr_bounds[1] if not iqr_violating.empty else None
+
+    # The rule's own min_exclusive only still applies to the final
+    # (post-union) lower bound when that bound actually came from the
+    # rule itself (rather than a statistically-tighter IQR lower bound
+    # taking over) -- see the max() above.
+    final_min_exclusive = bool(
+        named_rule is not None and named_rule.get("min_exclusive") and lower_bound_for_details == negative_rule_min
+    )
+
+    if not iqr_violating.empty:
+        description = (
+            f"statistically extreme (outside {iqr_bounds[0]:.2f} to {iqr_bounds[1]:.2f}, "
+            "based on this column's own distribution)"
+        )
+    else:
+        lower_text = f"> {negative_rule_min:g}" if final_min_exclusive else f">= {negative_rule_min:g}"
+        description = f"expected {lower_text}"
+    details = {
+        "rule": description, "lower_bound": lower_bound_for_details, "upper_bound": upper_bound_for_details,
+        "min_exclusive": final_min_exclusive,
+    }
+    return combined_violating, description, details
 
 
 # ---------------------------------------------------------------------------
@@ -422,9 +569,9 @@ def _check_categorical_inconsistency(values: List[str]) -> Optional[Tuple[dict, 
          already among the column's established/repeated forms -- see
          the "dominant" comment below) against those established forms,
          keeping a match ONLY when it clears CATEGORICAL_FUZZY_THRESHOLD.
-    Declines (returns None) entirely for a column that doesn't look
-    categorical at all -- see _MAX_DISTINCT_RATIO_FOR_CATEGORICAL's
-    docstring above.
+    Declines the fuzzy stage (though not the curated-alias stage) for a
+    column that doesn't look categorical at all -- see
+    "eligible_for_fuzzy_matching" below.
     """
     if not values:
         return None
@@ -442,8 +589,6 @@ def _check_categorical_inconsistency(values: List[str]) -> Optional[Tuple[dict, 
     if distinct_count < 2:
         return None
     if distinct_count > _MAX_ABSOLUTE_DISTINCT_FOR_CATEGORICAL:
-        return None
-    if distinct_count / len(values) > _MAX_DISTINCT_RATIO_FOR_CATEGORICAL:
         return None
 
     # The canonical form for each key is the most-frequent EXACT
@@ -465,39 +610,69 @@ def _check_categorical_inconsistency(values: List[str]) -> Optional[Tuple[dict, 
     repeated_keys = [key for key, count in sorted_keys if count >= 2]
     dominant_keys = repeated_keys[:_DOMINANT_VARIANT_TOP_N] or [sorted_keys[0][0]]
     minority_keys = [key for key, _count in sorted_keys if key not in dominant_keys]
-    if not dominant_keys:
-        return None
+
+    # Fuzzy matching (below) is eligible ONLY when at least one key is
+    # genuinely REPEATED -- i.e. there's a real, established "house
+    # style" to match typos against. When NOTHING repeats (every value's
+    # key is unique), dominant_keys above is just an arbitrary fallback
+    # to the single most common key -- exactly the free-text case
+    # (Business_Name, Address) this guard exists to protect against, so
+    # fuzzy matching must stay off there. This is deliberately NOT a
+    # ratio/ceiling on total distinct values -- a column can have many
+    # legitimate distinct categories (City, with dozens of real cities)
+    # and still be perfectly safe to fuzzy-match, as long as its real
+    # categories are each actually repeated.
+    eligible_for_fuzzy_matching = bool(repeated_keys)
+
+    canonical_map: Dict[str, dict] = {}
     # NOTE: deliberately no early return when minority_keys is empty --
     # a column can have ZERO minority keys (every value's key is already
     # "established") and still need a fix, via the dominant-key-variant
     # step just below (e.g. "BMW"/"BMW"/"B.M.W" are ALL the dominant
     # "bmw" key -- there's no minority key here at all, but "B.M.W" still
-    # needs correcting to "BMW"). Returning None here would skip that
-    # step entirely.
+    # needs correcting to "BMW").
+    if eligible_for_fuzzy_matching and dominant_keys:
+        for minority_key in minority_keys:
+            match = process.extractOne(
+                minority_key, dominant_keys, scorer=_categorical_similarity, score_cutoff=CATEGORICAL_FUZZY_THRESHOLD,
+            )
+            if match is None:
+                continue
+            matched_key, score, _index = match
+            canonical_map[minority_key] = {
+                "canonical": canonical_spelling[matched_key],
+                "score": round(float(score), 2),
+            }
 
-    canonical_map: Dict[str, dict] = {}
-    for minority_key in minority_keys:
-        match = process.extractOne(
-            minority_key, dominant_keys, scorer=_categorical_similarity, score_cutoff=CATEGORICAL_FUZZY_THRESHOLD,
-        )
-        if match is None:
+        # A DOMINANT key can still have more than one distinct EXACT
+        # spelling sharing it -- e.g. "BMW" and "B.M.W" both collapse to
+        # the key "bmw" (see categorical_key's docstring), but "B.M.W" is
+        # still its own literal string sitting in the data. That's a
+        # full-confidence, non-fuzzy fix (same key -- not a guess at
+        # all), so it gets added at score 100.0 regardless of
+        # CATEGORICAL_FUZZY_THRESHOLD, separate from the fuzzy
+        # minority-key matching above.
+        for key in dominant_keys:
+            if len(variant_counts_by_key[key]) > 1:
+                canonical_map[key] = {"canonical": canonical_spelling[key], "score": 100.0}
+
+    # Curated alias overrides (see _KNOWN_CATEGORICAL_ALIASES docstring):
+    # exact, case-insensitive, always applied when not already covered
+    # above; conditional aliases only when this column's own dominant
+    # spelling already agrees with the target.
+    dominant_canonical_spellings = {canonical_spelling[key] for key in dominant_keys}
+    for key in normalized_counts:
+        if key in canonical_map:
             continue
-        matched_key, score, _index = match
-        canonical_map[minority_key] = {
-            "canonical": canonical_spelling[matched_key],
-            "score": round(float(score), 2),
-        }
-
-    # A DOMINANT key can still have more than one distinct EXACT
-    # spelling sharing it -- e.g. "BMW" and "B.M.W" both collapse to the
-    # key "bmw" (see categorical_key's docstring), but "B.M.W" is still
-    # its own literal string sitting in the data. That's a full-
-    # confidence, non-fuzzy fix (same key -- not a guess at all), so it
-    # gets added at score 100.0 regardless of CATEGORICAL_FUZZY_THRESHOLD,
-    # separate from the fuzzy minority-key matching above.
-    for key in dominant_keys:
-        if len(variant_counts_by_key[key]) > 1:
-            canonical_map[key] = {"canonical": canonical_spelling[key], "score": 100.0}
+        raw_spelling = canonical_spelling[key]
+        lower_spelling = raw_spelling.strip().lower()
+        alias_target = _KNOWN_CATEGORICAL_ALIASES.get(lower_spelling)
+        if alias_target is None:
+            conditional_target = _CONDITIONAL_CATEGORICAL_ALIASES.get(lower_spelling)
+            if conditional_target is not None and conditional_target in dominant_canonical_spellings:
+                alias_target = conditional_target
+        if alias_target is not None and alias_target != raw_spelling:
+            canonical_map[key] = {"canonical": alias_target, "score": 100.0}
 
     if not canonical_map:
         return None

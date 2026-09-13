@@ -22,10 +22,34 @@ import pandas as pd
 
 
 # Column-name substrings (lowercased) that suggest a column should hold a
-# unique identifier per row. Used to decide which columns get checked for
+# PER-ROW-UNIQUE identifier -- a real primary/transaction key, not a
+# repeating dimension. Used to decide which columns get checked for
 # duplicate values -- checking every column would be noisy (a City column
 # is SUPPOSED to repeat; a GST number is not).
-IDENTIFIER_COLUMN_NAME_HINTS = ["gst", "pan", "_id", "id_", "code", "registration_no", "license_no"]
+IDENTIFIER_COLUMN_NAME_HINTS = [
+    "gst", "pan", "order_id", "order_no", "invoice_id", "invoice_no",
+    "transaction_id", "txn_id", "receipt_no", "bill_no", "registration_no", "license_no",
+]
+
+# Column-name substrings that mean "this column names WHO/WHAT the row is
+# about" -- a foreign-key-style reference into a master/dimension table
+# (a customer, vendor, product, employee, ...). These LEGITIMATELY repeat
+# many times in transactional/order-level data (the same customer places
+# many orders), so even a bare "_id"/"code" hint below must never flag
+# one of these as "should be unique". This is the fix for the false-
+# positive "Customer_ID looks like a duplicate identifier" finding on
+# normal order data.
+_DIMENSION_REFERENCE_NAME_HINTS = [
+    "customer", "client", "vendor", "supplier", "user", "account",
+    "employee", "staff", "product", "item", "category", "party",
+]
+
+# A bare "_id"/"id_"/trailing "id"/"code" hint (unlike the explicit
+# transaction-key names above) is only trusted as "should be unique" when
+# the column name does NOT also look like a dimension reference -- e.g.
+# a plain "ID" or "Record_Code" column still counts, but "Customer_ID"
+# and "Product_Code" do not.
+_GENERIC_ID_HINTS = ["_id", "id_", "code"]
 
 # Flat penalty subtracted from 100 per structural issue found. A flat
 # penalty (rather than a percentage-based one, like completeness/
@@ -127,8 +151,12 @@ def _find_identifier_duplicates(dataframe: pd.DataFrame) -> List[StructureIssue]
 
     for column_name in dataframe.columns:
         column_name_lower = str(column_name).lower()
-        looks_like_identifier = any(hint in column_name_lower for hint in IDENTIFIER_COLUMN_NAME_HINTS)
-        if not looks_like_identifier:
+        is_dimension_reference = any(hint in column_name_lower for hint in _DIMENSION_REFERENCE_NAME_HINTS)
+        looks_like_transaction_key = any(hint in column_name_lower for hint in IDENTIFIER_COLUMN_NAME_HINTS)
+        looks_like_generic_id = (
+            any(hint in column_name_lower for hint in _GENERIC_ID_HINTS) and not is_dimension_reference
+        )
+        if not (looks_like_transaction_key or looks_like_generic_id):
             continue
 
         non_missing_values = dataframe[column_name].dropna()
