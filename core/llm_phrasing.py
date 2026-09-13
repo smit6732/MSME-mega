@@ -82,6 +82,11 @@ _ISSUE_TYPE_HUMANIZED = {
     "exact_duplicate_rows": "exact duplicate rows",
     "fuzzy_duplicate_rows": "near-duplicate records",
     "structural_issue": "a structural data issue",
+    "invalid_type_in_numeric": "non-numeric values in a numeric column",
+    "invalid_type_in_date": "non-date values in a date column",
+    "categorical_inconsistency": "inconsistent category spellings",
+    "domain_outlier": "values outside a realistic range",
+    "missing_value_representation": "placeholder text standing in for missing data",
 }
 
 

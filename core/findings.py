@@ -30,13 +30,14 @@ SEVERITY_CRITICAL = "critical"
 SEVERITY_MODERATE = "moderate"
 SEVERITY_MINOR = "minor"
 
-# The four scorecard dimensions, as machine-readable labels. Matches the
-# four check modules: core/completeness.py, core/consistency.py,
-# core/duplication.py, core/structure.py.
+# The scorecard dimensions, as machine-readable labels. Matches the check
+# modules: core/completeness.py, core/consistency.py, core/duplication.py,
+# core/structure.py, core/validity.py.
 CHECK_TYPE_COMPLETENESS = "completeness"
 CHECK_TYPE_CONSISTENCY = "consistency"
 CHECK_TYPE_DUPLICATION = "duplication"
 CHECK_TYPE_STRUCTURE = "structure"
+CHECK_TYPE_VALIDITY = "validity"
 
 
 @dataclass
@@ -75,6 +76,18 @@ class Finding:
     # NEEDS to reach core/llm_phrasing.py's prompt for the AI-phrased
     # sentence to be able to keep it -- see that module's docstring.
     example: Optional[str] = None
+    # Optional structured facts a Finding needs to carry so a LATER stage
+    # can act on it WITHOUT re-deriving them from scratch -- e.g. the
+    # exact minority-spelling -> canonical-spelling map core/validity.py
+    # already computed for a categorical_inconsistency Finding, or the
+    # numeric bounds it already computed for a domain_outlier Finding.
+    # This keeps core/remediation.py "Finding-driven, not a fresh scan"
+    # (see that module's docstring) even for fixes that need more than a
+    # plain example string to apply safely: it reuses these exact
+    # already-computed facts rather than re-fitting them against a
+    # (possibly already-modified) copy of the data. None for every issue
+    # type that doesn't need this -- which is most of them.
+    details: Optional[dict] = None
 
     @property
     def display_description(self) -> str:

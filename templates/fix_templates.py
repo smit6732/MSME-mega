@@ -123,6 +123,81 @@ FIX_TEMPLATES = {
         ],
     },
 
+    "invalid_type_in_numeric": {
+        SEVERITY_CRITICAL: [
+            "'{field}' should be a number, but {percentage}% of values (e.g. \"{example}\") are not numeric at all — these can't be calculated on until they're fixed or cleared.",
+            "{percentage}% of '{field}' contains non-numeric text like \"{example}\" in a column that should be numbers — this needs attention before any calculation uses this column.",
+        ],
+        SEVERITY_MODERATE: [
+            "'{field}' has {percentage}% of values, like \"{example}\", that aren't valid numbers at all (not just badly formatted).",
+            "About {percentage}% of '{field}' entries, e.g. \"{example}\", are non-numeric text sitting in a numeric column.",
+        ],
+        SEVERITY_MINOR: [
+            "A small number of '{field}' values ({percentage}%), e.g. \"{example}\", aren't valid numbers.",
+            "'{field}' is mostly valid numbers, aside from {percentage}% of entries like \"{example}\".",
+        ],
+    },
+
+    "invalid_type_in_date": {
+        SEVERITY_CRITICAL: [
+            "'{field}' should be a date, but {percentage}% of values (e.g. \"{example}\") aren't recognizable as a date at all.",
+            "{percentage}% of '{field}' contains text like \"{example}\" that isn't any known date format — not just a different format, not a date at all.",
+        ],
+        SEVERITY_MODERATE: [
+            "'{field}' has {percentage}% of values, like \"{example}\", that don't parse as a date in any recognized format.",
+            "About {percentage}% of '{field}' entries, e.g. \"{example}\", aren't valid dates at all.",
+        ],
+        SEVERITY_MINOR: [
+            "A small number of '{field}' values ({percentage}%), e.g. \"{example}\", aren't recognizable dates.",
+            "'{field}' is mostly valid dates, aside from {percentage}% of entries like \"{example}\".",
+        ],
+    },
+
+    "categorical_inconsistency": {
+        SEVERITY_CRITICAL: [
+            "'{field}' has {percentage}% of values that look like typos or variant spellings of another value in the same column (e.g. \"{example}\") — these will silently split one real category into several.",
+            "{percentage}% of '{field}' entries appear to be misspelled versions of a more common value (e.g. \"{example}\") — worth standardizing before grouping or counting by this column.",
+        ],
+        SEVERITY_MODERATE: [
+            "'{field}' has {percentage}% of values, like \"{example}\", that look like spelling variants of a more common category.",
+            "About {percentage}% of '{field}' entries, e.g. \"{example}\", may be typos of an existing category in this column.",
+        ],
+        SEVERITY_MINOR: [
+            "A small number of '{field}' values ({percentage}%), e.g. \"{example}\", look like possible spelling variants.",
+            "'{field}' is mostly consistent categories, aside from {percentage}% of possible variants like \"{example}\".",
+        ],
+    },
+
+    "domain_outlier": {
+        SEVERITY_CRITICAL: [
+            "'{field}' has {percentage}% of values that are outside a realistic range for this field (e.g. \"{example}\") — these look like data-entry errors, not real values.",
+            "{percentage}% of '{field}' values, such as \"{example}\", fall well outside what's realistically possible for this field.",
+        ],
+        SEVERITY_MODERATE: [
+            "'{field}' has {percentage}% of values, like \"{example}\", outside the range that's realistic for this field — worth a second look.",
+            "About {percentage}% of '{field}' entries, e.g. \"{example}\", look like they may be data-entry errors.",
+        ],
+        SEVERITY_MINOR: [
+            "A small number of '{field}' values ({percentage}%), e.g. \"{example}\", sit outside this field's usual range.",
+            "'{field}' is mostly within a realistic range, aside from {percentage}% of values like \"{example}\".",
+        ],
+    },
+
+    "missing_value_representation": {
+        SEVERITY_CRITICAL: [
+            "'{field}' has {percentage}% of rows using a placeholder like \"{example}\" instead of being left truly blank — these are missing data in disguise.",
+            "{percentage}% of '{field}' values are placeholder text (e.g. \"{example}\") rather than real data — treat these the same as blank cells.",
+        ],
+        SEVERITY_MODERATE: [
+            "'{field}' has {percentage}% of values, like \"{example}\", that are placeholder text standing in for a real (missing) value.",
+            "About {percentage}% of '{field}' entries use a placeholder such as \"{example}\" instead of a real value.",
+        ],
+        SEVERITY_MINOR: [
+            "A small number of '{field}' values ({percentage}%), e.g. \"{example}\", are placeholder text rather than real data.",
+            "'{field}' is mostly real values, aside from {percentage}% of placeholders like \"{example}\".",
+        ],
+    },
+
     "structural_issue": {
         SEVERITY_CRITICAL: [
             "Structural problem: {example} This affects how reliably the file can be loaded and processed at all.",

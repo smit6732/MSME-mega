@@ -42,6 +42,7 @@ page's markup.
 """
 
 import html
+import io
 import re
 from urllib.parse import quote
 
@@ -50,8 +51,10 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from core.pipeline import run_multi_table_pipeline
+from core.pipeline import run_multi_table_pipeline, run_pipeline_for_table
+from core.ingestion import load_dataset
 from core.remediation import remediate_table
+from core.cleaning_config import INTENSITY_PRESETS
 from core.chart_generation import generate_charts_for_table
 
 
@@ -88,6 +91,7 @@ DIMENSION_META = [
     ("consistency_score", "Consistency", "consistency", "Whether values are formatted the same way throughout."),
     ("duplication_score", "Duplication", "duplication", "Exact and near-duplicate records."),
     ("structure_score", "Structure", "structure", "Whether the file itself is sound -- headers, columns, IDs."),
+    ("validity_score", "Validity", "validity", "Whether present, well-formatted values are actually realistic."),
 ]
 
 # One small, hand-authored inline SVG per dimension -- deliberately NOT
@@ -129,6 +133,13 @@ _DIMENSION_ICONS = {
         '<line x1="3" y1="9" x2="21" y2="9"/>'
         '<line x1="3" y1="15" x2="21" y2="15"/>'
         '<line x1="9" y1="3" x2="9" y2="21"/>'
+        "</svg>"
+    ),
+    "validity": (
+        '<svg class="mdq-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+        'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+        '<circle cx="12" cy="12" r="9"/>'
+        '<path d="M9.5 12.5l1.8 1.8 3.2-4.2"/>'
         "</svg>"
     ),
 }
@@ -215,7 +226,8 @@ _STAGE_LABELS = {
     "consistency": "Checking consistency — formatting patterns per column…",
     "duplication": "Scanning for exact and near-duplicate rows…",
     "structure": "Validating headers and file structure…",
-    "scoring": "Combining the four dimension scores…",
+    "validity": "Checking validity — realistic values and known types…",
+    "scoring": "Combining the five dimension scores…",
     "fixlist": "Generating the fix list (loading local AI model on first run)…",
 }
 
@@ -586,7 +598,8 @@ def _build_theme_css() -> str:
     .mdq-count-chip .lbl {{ font-size: .78rem; color: var(--text-secondary); font-weight: 600; }}
 
     /* ---- Dimension score grid ---------------------------------------------- */
-    .mdq-dim-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; margin: .6rem 0 1rem; }}
+    .mdq-dim-grid {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .9rem; margin: .6rem 0 1rem; }}
+    @media (max-width: 900px) {{ .mdq-dim-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }} }}
     @media (max-width: 700px) {{ .mdq-dim-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
     .mdq-dim-card {{ background: var(--bg-muted); border: 1px solid var(--border-subtle); border-radius: 12px; padding: .9rem 1.05rem;
                      box-shadow: var(--card-shadow); }}
@@ -643,7 +656,8 @@ def _build_theme_css() -> str:
     .mdq-table td.num.combined {{ font-weight: 700; }}
 
     /* ---- Empty / first-run state -------------------------------------------- */
-    .mdq-empty-grid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; margin: 1.4rem 0; }}
+    .mdq-empty-grid {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .9rem; margin: 1.4rem 0; }}
+    @media (max-width: 900px) {{ .mdq-empty-grid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }} }}
     @media (max-width: 700px) {{ .mdq-empty-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
     .mdq-empty-card, .mdq-feature-card {{ background: var(--bg-elevated); border: 1px solid var(--border); border-radius: 8px; padding: 1.1rem 1.2rem; }}
     .mdq-empty-card .icon, .mdq-feature-card .icon {{ font-size: 1.5rem; }}
@@ -707,7 +721,8 @@ def _build_theme_css() -> str:
     .mdq-skeleton {{ background: linear-gradient(90deg, var(--bg-muted) 25%, var(--border-subtle) 50%, var(--bg-muted) 75%);
                      background-size: 200% 100%; animation: mdq-shimmer 1.4s ease-in-out infinite; }}
     .mdq-skel-hero {{ height: 118px; border-radius: 18px; margin-bottom: .9rem; }}
-    .mdq-skel-dimgrid {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .9rem; }}
+    .mdq-skel-dimgrid {{ display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: .9rem; }}
+    @media (max-width: 900px) {{ .mdq-skel-dimgrid {{ grid-template-columns: repeat(3, minmax(0, 1fr)); }} }}
     @media (max-width: 700px) {{ .mdq-skel-dimgrid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
     .mdq-skel-dim {{ height: 92px; border-radius: 12px; }}
 
@@ -875,6 +890,16 @@ _ACTION_TYPE_LABELS = {
     "normalize_date_format": "Normalized date format",
     "trim_whitespace": "Trimmed whitespace",
     "remove_exact_duplicate_rows": "Removed exact duplicate row(s)",
+    "coerce_invalid_numeric": "Cleared non-numeric values",
+    "coerce_invalid_date": "Cleared non-date values",
+    "normalize_missing_token": "Normalized placeholder to blank",
+    "standardize_categorical_spelling": "Standardized spelling variant",
+    "neutralize_domain_outlier": "Cleared out-of-range value",
+    "clip_domain_outlier": "Clipped out-of-range value",
+    "drop_rows_missing_value": "Dropped row(s) with missing value",
+    "fill_missing_constant": "Filled missing value (constant)",
+    "fill_missing_median": "Filled missing value (median)",
+    "fill_missing_mode": "Filled missing value (mode)",
 }
 
 
@@ -1009,20 +1034,61 @@ def _low_cardinality_note(dataframe: pd.DataFrame, column_name: str) -> str:
     return f'This column has only {distinct} unique {value_word} — e.g. "{top_value}" appears in {top_count} of {len(non_blank)} rows.'
 
 
+_CLEANING_INTENSITY_HELP = (
+    "**Conservative** (default): exactly this project's original safe fixes, plus type-coercion "
+    "and placeholder normalization -- both unconditionally safe. Casing is never changed, outliers "
+    "are cleared not guessed at, and missing data always goes to manual review.\n\n"
+    "**Standard**: also standardizes very-high-confidence spelling variants (e.g. \"Diesal\" -> "
+    "\"Diesel\") and dominant-case casing.\n\n"
+    "**Aggressive**: trusts every spelling-variant match validity.py's own detection floor allows, "
+    "and clips out-of-range numeric values to the nearest realistic bound instead of clearing them. "
+    "⚠️ Review the audit log carefully after using this setting."
+)
+
+
+def _rescore_cleaned_dataframe(cleaned_dataframe: pd.DataFrame, table_name: str):
+    """
+    Re-runs the FULL diagnostic pipeline on the cleaned output, purely so
+    the UI can show a "before vs after" score -- this is a completely
+    separate, second scoring pass over the cleaned data, never a
+    modification of the original score (see render_remediation_section's
+    own banner, and core/remediation.py's module docstring: cleaning can
+    never feed back into the diagnostic score it was computed from).
+    Round-trips through an actual CSV encode/decode (not a direct
+    DatasetProfile construction) so this re-score sees EXACTLY what a
+    user re-uploading the downloaded file would see -- same code path,
+    no shortcuts. Returns None if the cleaned data is empty or otherwise
+    unscoreable (e.g. every row was dropped) rather than raising.
+    """
+    if cleaned_dataframe.empty:
+        return None
+    try:
+        csv_bytes = cleaned_dataframe.to_csv(index=False).encode("utf-8")
+        buffer = io.BytesIO(csv_bytes)
+        buffer.name = f"{_safe_filename_stub(table_name)}_cleaned.csv"
+        reloaded_profile = load_dataset(buffer, buffer.name)
+        return run_pipeline_for_table(reloaded_profile, table_name, use_ai_phrasing=False)
+    except Exception:
+        # Re-scoring is a nice-to-have UI comparison, not a guarantee --
+        # if the cleaned data genuinely can't be re-scored for some
+        # reason, the rest of this section (audit log, download) must
+        # still work; silently skipping just the comparison is the right
+        # failure mode here, not surfacing a raw traceback.
+        return None
+
+
 def render_remediation_section(table_result) -> None:
     """
-    Tier 1's whole UI: cleaning summary, cleaned-CSV download, and the
-    dashboard -- rendered inside the SAME per-table expander as the
-    diagnostic score (render_table_section), but visually separated by a
-    divider and its own banner making explicit that the score above is
-    always about the ORIGINAL data. Cleaning is a separate, optional
-    output path -- see core/remediation.py's module docstring for why
-    that separation is a hard project requirement, not a UI choice.
+    Tier 1's whole UI: cleaning-intensity selector, cleaning summary
+    (audit log), before/after score comparison, cleaned-data download,
+    and the per-column dashboard -- rendered inside the SAME per-table
+    expander as the diagnostic score (render_table_section), but
+    visually separated by a divider and its own banner making explicit
+    that the score above is always about the ORIGINAL data. Cleaning is
+    a separate, optional output path -- see core/remediation.py's module
+    docstring for why that separation is a hard project requirement, not
+    a UI choice.
     """
-    remediation = remediate_table(
-        table_result.dataframe, table_result.findings, table_result.duplication_result.exact_duplicate_row_indexes,
-    )
-
     st.divider()
     render_html(
         '<div class="mdq-section-title" style="margin-top:0;">🧹 Cleaned Data & Dashboard</div>'
@@ -1031,7 +1097,24 @@ def render_remediation_section(table_result) -> None:
         "<b>original</b> data -- nothing below it ever changes that score.</div>"
     )
 
-    # -- Cleaning summary --------------------------------------------------
+    # -- Cleaning intensity --------------------------------------------------
+    intensity_key = f"cleaning-intensity-{table_result.table_name}"
+    intensity_choice = st.selectbox(
+        "Cleaning intensity", options=list(INTENSITY_PRESETS.keys()), index=0,
+        key=intensity_key, help=_CLEANING_INTENSITY_HELP,
+    )
+    if intensity_choice != "Conservative":
+        render_html(
+            f'<div class="mdq-banner mdq-banner-warn">⚠️ "{_html(intensity_choice)}" trusts more '
+            "automatic fixes than the conservative default -- always check the audit log below.</div>"
+        )
+
+    remediation = remediate_table(
+        table_result.dataframe, table_result.findings, table_result.duplication_result.exact_duplicate_row_indexes,
+        config=INTENSITY_PRESETS[intensity_choice],
+    )
+
+    # -- Cleaning summary (audit log) ----------------------------------------
     render_html('<div class="mdq-table-sub" style="margin-top:.2rem;">Fixes actually applied</div>')
     if remediation.actions:
         render_html(_remediation_actions_table_html(remediation.actions))
@@ -1048,6 +1131,25 @@ def render_remediation_section(table_result) -> None:
                         f'<span class="mdq-tag-table">{_html(item.finding.issue_type)}</span>'
                         f"<br/>{_html(item.reason)}</div>"
                     )
+
+    # -- Before vs after score ------------------------------------------------
+    rescored = _rescore_cleaned_dataframe(remediation.cleaned_dataframe, table_result.table_name)
+    if rescored is not None:
+        before_score = table_result.scorecard.overall_score
+        after_score = rescored.scorecard.overall_score
+        delta = round(after_score - before_score, 1)
+        delta_text = f"+{delta}" if delta > 0 else str(delta)
+        delta_tier = "minor" if delta > 0 else ("critical" if delta < 0 else "moderate")
+        render_html(
+            f"""
+            <div class="mdq-table-sub" style="margin-top:1rem;">Score if you re-ran diagnosis on this cleaned data</div>
+            <div class="mdq-count-row">
+              <div class="mdq-count-chip"><span class="n">{before_score:.1f}</span><span class="lbl">Original score</span></div>
+              <div class="mdq-count-chip"><span class="n">{after_score:.1f}</span><span class="lbl">Cleaned score</span></div>
+              <div class="mdq-count-chip"><span class="n" style="color:var(--{delta_tier});">{delta_text}</span><span class="lbl">Change</span></div>
+            </div>
+            """
+        )
 
     # -- Download -----------------------------------------------------------
     csv_bytes = remediation.cleaned_dataframe.to_csv(index=False).encode("utf-8")
@@ -1257,14 +1359,14 @@ def render_empty_state():
     """
     The first-run screen, designed on purpose rather than left blank --
     this is most people's actual first impression of the tool. Explains
-    what it does and what the four dimensions mean before anyone uploads
+    what it does and what the five dimensions mean before anyone uploads
     anything, plus a pointer to a sample file to try.
     """
     render_html('<div class="mdq-section-title">What this tool checks</div>')
-    # Real st.columns(4) (not a single CSS grid div) -- each dimension is
+    # Real st.columns (not a single CSS grid div) -- each dimension is
     # its own layout block, styled via .mdq-feature-card for the elevated,
     # shadow-hover "dashboard widget" look.
-    feature_cols = st.columns(4)
+    feature_cols = st.columns(len(DIMENSION_META))
     for col, (_attr, label, icon_key, description) in zip(feature_cols, DIMENSION_META):
         with col:
             render_html(
@@ -1508,6 +1610,7 @@ def main():
             '<div class="mdq-skel-dimgrid">'
             '<div class="mdq-skeleton mdq-skel-dim"></div><div class="mdq-skeleton mdq-skel-dim"></div>'
             '<div class="mdq-skeleton mdq-skel-dim"></div><div class="mdq-skeleton mdq-skel-dim"></div>'
+            '<div class="mdq-skeleton mdq-skel-dim"></div>'
             "</div>"
         )
 

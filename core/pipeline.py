@@ -25,6 +25,7 @@ from core.completeness import check_completeness
 from core.consistency import check_consistency
 from core.duplication import check_duplication, DuplicationResult
 from core.structure import check_structure
+from core.validity import check_validity
 from core.scoring import build_scorecard, ScorecardResult
 from core.fixlist import generate_fix_list
 from core.calibration import ThresholdCalibration
@@ -124,9 +125,13 @@ def run_pipeline_for_table(
     duplication_result = check_duplication(dataset_profile.dataframe, dataset_profile.column_types)
     _report("structure")
     structure_result = check_structure(dataset_profile.dataframe, dataset_profile.raw_text)
+    _report("validity")
+    validity_result = check_validity(dataset_profile.dataframe, dataset_profile.column_types)
 
     _report("scoring")
-    scorecard = build_scorecard(completeness_result, consistency_result, duplication_result, structure_result)
+    scorecard = build_scorecard(
+        completeness_result, consistency_result, duplication_result, structure_result, validity_result,
+    )
 
     _report("fixlist")
     findings, critical_cutoff, moderate_cutoff = generate_fix_list(
@@ -137,6 +142,7 @@ def run_pipeline_for_table(
         dataset_profile.row_count,
         table_name=table_name,
         use_ai_phrasing=use_ai_phrasing,
+        validity_result=validity_result,
     )
 
     duplicate_threshold = ThresholdCalibration(

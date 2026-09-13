@@ -27,6 +27,10 @@ from core.calibration import calibrate_duplicate_threshold, calibrate_severity_t
 from core.findings import Finding
 from core.remediation import remediate_table
 from core.chart_generation import generate_charts_for_table
+from core.validity import check_validity, is_coercible_numeric_token, is_recognized_date_token
+from core.completeness import check_completeness
+from core.scoring import build_scorecard
+from core.cleaning_config import CleaningConfig, CONSERVATIVE, STANDARD, AGGRESSIVE, MISSING_STRATEGY_DROP_ROW, MISSING_STRATEGY_CONSTANT
 import core.llm_phrasing as llm_phrasing
 
 
@@ -49,9 +53,15 @@ def test_single_csv_still_loads_and_scores():
 
     result = run_pipeline_for_table(dataset_profile, "messy_msme_sample.csv", use_ai_phrasing=False)
     assert 0 <= result.scorecard.overall_score <= 100
-    # This sample file is deliberately messy -- it should NOT score as
-    # "good" (>=80). If it does, a check is probably broken.
-    assert result.scorecard.overall_score < 80
+    # This sample file is deliberately messy on completeness/consistency/
+    # duplication -- it should NOT score as excellent. Its own numeric
+    # and date columns happen to have no Validity-dimension problems
+    # (see core/validity.py), so adding that 5th dimension legitimately
+    # nudges the overall score up from this test's original <80 bar --
+    # that's the new dimension correctly reporting "this specific facet
+    # is fine", not a broken check. <90 keeps the real intent: this file
+    # is clearly imperfect, not a false "everything's great" result.
+    assert result.scorecard.overall_score < 90
     assert len(result.findings) > 0
 
 
@@ -989,6 +999,370 @@ def test_chart_generation_makes_one_chart_per_column_with_matching_annotations()
     assert chart_by_column["Registration_Date"].chart_type == "date_over_time"
 
 
+# ---- Dimension 5: core/validity.py -----------------------------------------
+
+def test_validity_flags_invalid_type_in_numeric_and_ignores_valid_values():
+    """The spec's own headline examples ("unknown", "N/A", "high", "ask",
+    "TBD", "??") in an otherwise-numeric column must all be flagged as a
+    problem -- some as invalid_type_in_numeric (genuine garbage text: 'high',
+    'ask', '??'), the rest as missing_value_representation ('unknown',
+    'N/A', 'TBD' are all disguised-missing tokens -- see
+    core/completeness.py's MISSING_VALUE_TOKENS, which validity.py reuses
+    so the same cell is never double-flagged under both issue types).
+    None of the genuinely valid numbers should be flagged either way."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Price": ["50000", "unknown", "N/A", "high", "ask", "TBD", "??", "62000", "71000"]})
+    result = check_validity(dataframe, {"Price": "numeric"})
+
+    invalid_candidates = [c for c in result.candidates if c.issue_type == "invalid_type_in_numeric"]
+    assert len(invalid_candidates) == 1
+    assert invalid_candidates[0].column_name == "Price"
+    assert set(invalid_candidates[0].details["invalid_examples"]) == {"high", "ask", "??"}
+
+    missing_repr_candidates = [c for c in result.candidates if c.issue_type == "missing_value_representation"]
+    assert len(missing_repr_candidates) == 1
+    assert set(missing_repr_candidates[0].details["tokens_found"]) == {"unknown", "N/A", "TBD"}
+
+
+def test_validity_flags_invalid_type_in_date():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Sale_Date": ["2020-01-15", "2021-03-02", "invalid", "not a date", "2019-11-30"]})
+    result = check_validity(dataframe, {"Sale_Date": "date"})
+
+    candidates = [c for c in result.candidates if c.issue_type == "invalid_type_in_date"]
+    assert len(candidates) == 1
+    assert result.per_column["Sale_Date"].invalid_count == 2
+
+
+def test_validity_flags_categorical_typos_against_dominant_spelling():
+    """The spec's own headline example: Diesel/diesel/Diesal/Dizel must
+    all map to the dominant spelling 'Diesel'; BMW/bmw/B.M.W/BMV must
+    all map to 'BMW'. A minority spelling that's genuinely unrelated
+    (e.g. a real third category) must NOT be forced into either bucket."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Fuel_Type": [
+        "Diesel", "Diesel", "Diesel", "Diesel", "Diesel", "Diesel", "diesel", "Diesal", "Dizel",
+        "Petrol", "Petrol", "Petrol",
+    ]})
+    result = check_validity(dataframe, {"Fuel_Type": "text"})
+
+    candidates = [c for c in result.candidates if c.issue_type == "categorical_inconsistency"]
+    assert len(candidates) == 1
+    canonical_map = candidates[0].details["canonical_map"]
+    # "diesel" (lowercase, exact-case variant) is already caught by
+    # consistency.py's own dominant-variant check, not this one -- but
+    # it's still a MINORITY normalized form here too (count 1), so it's
+    # fine either way; what matters is the genuine misspellings resolve
+    # to the real dominant spelling, and Petrol (a real category) never
+    # gets touched.
+    assert canonical_map["diesal"]["canonical"] == "Diesel"
+    assert canonical_map["dizel"]["canonical"] == "Diesel"
+    assert "petrol" not in canonical_map
+
+
+def test_validity_declines_categorical_check_on_high_cardinality_free_text():
+    """A genuine free-text column (every value essentially unique, like a
+    Business_Name column) must never trigger categorical_inconsistency --
+    there's no real 'canonical form' to converge on, and fuzzy-matching
+    it would just invent false mappings between unrelated businesses."""
+    import pandas as pd
+
+    names = [f"Business {i} Traders" for i in range(30)]
+    dataframe = pd.DataFrame({"Business_Name": names})
+    result = check_validity(dataframe, {"Business_Name": "text"})
+
+    assert not [c for c in result.candidates if c.issue_type == "categorical_inconsistency"]
+
+
+def test_validity_flags_domain_outlier_for_named_rule_doors():
+    """Doors is a small fixed legal set {2,3,4,5} -- 9 doors is not a
+    plausible car, and must be flagged with the exact set in details."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Doors": ["2", "4", "4", "5", "9"]})
+    result = check_validity(dataframe, {"Doors": "numeric"})
+
+    candidates = [c for c in result.candidates if c.issue_type == "domain_outlier"]
+    assert len(candidates) == 1
+    assert candidates[0].details["allowed_set"] == [2, 3, 4, 5]
+
+
+def test_validity_flags_negative_mileage_and_impossible_year():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({
+        "Mileage": ["45000", "-500", "62000", "71000", "58000", "39000", "84000", "12000"],
+        "Year": ["2015", "2018", "2050", "2012", "2020", "2016", "2019", "2011"],
+    })
+    result = check_validity(dataframe, {"Mileage": "numeric", "Year": "numeric"})
+
+    mileage_candidates = [c for c in result.candidates if c.issue_type == "domain_outlier" and c.column_name == "Mileage"]
+    assert len(mileage_candidates) == 1
+    assert mileage_candidates[0].details["lower_bound"] == 0.0
+
+    year_candidates = [c for c in result.candidates if c.issue_type == "domain_outlier" and c.column_name == "Year"]
+    assert len(year_candidates) == 1  # 2050 is outside [1900, current_year+1]
+
+
+def test_validity_flags_missing_value_representation_tokens():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Owner_Notes": ["Good condition", "N/A", "Unknown", "Fine", "null"]})
+    result = check_validity(dataframe, {"Owner_Notes": "text"})
+
+    candidates = [c for c in result.candidates if c.issue_type == "missing_value_representation"]
+    assert len(candidates) == 1
+    assert set(candidates[0].details["tokens_found"]) == {"N/A", "Unknown", "null"}
+
+
+def test_completeness_treats_disguised_missing_tokens_as_missing():
+    """core/completeness.py's own missing definition must ALSO count
+    these placeholder tokens -- not just a true blank cell -- per this
+    feature's own requirement that completeness scoring reflect them."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Notes": ["Good", "N/A", "", "Fine", "unknown"]})
+    result = check_completeness(dataframe)
+
+    assert result.per_column["Notes"].missing_count == 3  # "N/A", "", "unknown"
+
+
+def test_scoring_backward_compatible_without_validity_result():
+    """build_scorecard called without a validity_result (every caller
+    that predates this feature) must use the ORIGINAL four-weight
+    formula and leave validity_score as None -- byte-identical to
+    before the Validity dimension existed."""
+    dataset_profile = load_dataset(TEST_DATASET_CSV, "test_dataset.csv")
+    result = run_pipeline_for_table(dataset_profile, "test_dataset.csv", use_ai_phrasing=False)
+
+    from core.completeness import check_completeness as _cc
+    from core.consistency import check_consistency as _co
+    from core.duplication import check_duplication as _du
+    from core.structure import check_structure as _st
+
+    completeness_result = _cc(dataset_profile.dataframe)
+    consistency_result = _co(dataset_profile.dataframe, dataset_profile.column_types)
+    duplication_result = _du(dataset_profile.dataframe, dataset_profile.column_types)
+    structure_result = _st(dataset_profile.dataframe, dataset_profile.raw_text)
+
+    legacy_scorecard = build_scorecard(completeness_result, consistency_result, duplication_result, structure_result)
+    assert legacy_scorecard.validity_score is None
+    for column_score in legacy_scorecard.per_column_scores.values():
+        assert column_score.validity_score is None
+
+    # And WITH a validity_result, the pipeline's own scorecard must carry
+    # a real validity_score.
+    assert result.scorecard.validity_score is not None
+
+
+# ---- Tier 1 remediation: new issue types + CleaningConfig ------------------
+
+def test_remediation_coerces_invalid_numeric_to_blank_never_guesses():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Price": ["50000", "unknown", "62000"]})
+    finding = _finding("invalid_type_in_numeric", column_name="Price")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert len(result.actions) == 1
+    assert result.actions[0].action_type == "coerce_invalid_numeric"
+    assert result.actions[0].count_affected == 1
+    cleaned = result.cleaned_dataframe["Price"]
+    assert cleaned.iloc[0] == "50000" and cleaned.iloc[2] == "62000"
+    assert pd.isna(cleaned.iloc[1])  # the invalid cell is now blank, never guessed at
+    assert dataframe["Price"].tolist() == ["50000", "unknown", "62000"]  # original untouched
+
+
+def test_remediation_coerces_invalid_date_to_blank():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Sale_Date": ["2020-01-15", "invalid", "2019-11-30"]})
+    finding = _finding("invalid_type_in_date", column_name="Sale_Date")
+
+    result = remediate_table(dataframe, [finding], [])
+
+    assert len(result.actions) == 1
+    assert result.actions[0].action_type == "coerce_invalid_date"
+    assert result.actions[0].count_affected == 1
+
+
+def test_remediation_normalizes_missing_token_to_blank_unconditionally():
+    """This fix needs no CleaningConfig gate -- it's always safe."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Notes": ["Good", "N/A", "Fine", "unknown"]})
+    finding = _finding("missing_value_representation", column_name="Notes")
+
+    result = remediate_table(dataframe, [finding], [], config=CONSERVATIVE)
+
+    assert len(result.actions) == 1
+    assert result.actions[0].action_type == "normalize_missing_token"
+    assert result.actions[0].count_affected == 2
+    cleaned = result.cleaned_dataframe["Notes"]
+    assert pd.isna(cleaned.iloc[1]) and pd.isna(cleaned.iloc[3])
+
+
+def test_remediation_categorical_standardization_respects_confidence_threshold():
+    """The Finding's canonical_map carries per-mapping match scores from
+    validity.py's own detection pass. remediation.py must apply ONLY the
+    mappings whose score clears THIS run's config.categorical_fuzzy_threshold
+    (CONSERVATIVE's default is 88) -- proving config, not a hardcoded
+    constant, governs what gets auto-applied, and that a below-threshold
+    match is skipped (noted) rather than silently applied or dropped."""
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Fuel_Type": ["Diesel"] * 8 + ["Diesal", "Dizel"]})
+    finding = _finding("categorical_inconsistency", column_name="Fuel_Type")
+    finding.details = {"canonical_map": {
+        "diesal": {"canonical": "Diesel", "score": 92.0},  # clears CONSERVATIVE's 88 floor
+        "dizel": {"canonical": "Diesel", "score": 85.0},   # does NOT clear it
+    }}
+
+    result = remediate_table(dataframe.copy(), [finding], [], config=CONSERVATIVE)
+    action = result.actions[0]
+    assert action.action_type == "standardize_categorical_spelling"
+    assert action.count_affected == 1  # only "Diesal" (92) was trusted
+    assert action.notes is not None  # the 85-score "Dizel" match was skipped and noted
+    assert "Diesel" in result.cleaned_dataframe["Fuel_Type"].tolist()
+    assert "Dizel" in result.cleaned_dataframe["Fuel_Type"].tolist()  # left unchanged, not dropped
+
+
+def test_remediation_domain_outlier_default_blanks_clip_mode_clips():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"Doors": ["2", "4", "9"]})
+    finding = _finding("domain_outlier", column_name="Doors")
+    finding.details = {"allowed_set": [2, 3, 4, 5]}
+
+    default_result = remediate_table(dataframe.copy(), [finding], [], config=CONSERVATIVE)
+    assert default_result.actions[0].action_type == "neutralize_domain_outlier"
+    assert pd.isna(default_result.cleaned_dataframe["Doors"].iloc[2])
+
+    dataframe2 = pd.DataFrame({"Mileage": ["45000", "-500"]})
+    finding2 = _finding("domain_outlier", column_name="Mileage")
+    finding2.details = {"lower_bound": 0.0, "upper_bound": None}
+
+    clip_config = CleaningConfig(outlier_action="clip")
+    clip_result = remediate_table(dataframe2.copy(), [finding2], [], config=clip_config)
+    assert clip_result.actions[0].action_type == "clip_domain_outlier"
+    assert clip_result.cleaned_dataframe["Mileage"].iloc[1] == "0"
+
+
+def test_remediation_missing_data_strategy_drop_row_and_constant():
+    import pandas as pd
+
+    dataframe = pd.DataFrame({"City": ["Ahmedabad", None, "Surat"]})
+    finding = _finding("missing_data", column_name="City", percentage_affected=33.3)
+
+    # Default (conservative) -- unchanged, still manual review.
+    default_result = remediate_table(dataframe.copy(), [finding], [])
+    assert default_result.actions == []
+    assert len(default_result.manual_review) == 1
+
+    # drop_row strategy actually removes the row.
+    drop_config = CleaningConfig(missing_strategy=MISSING_STRATEGY_DROP_ROW)
+    drop_result = remediate_table(dataframe.copy(), [finding], [], config=drop_config)
+    assert len(drop_result.cleaned_dataframe) == 2
+    assert drop_result.actions[0].action_type == "drop_rows_missing_value"
+
+    # constant strategy fills instead.
+    constant_config = CleaningConfig(missing_strategy=MISSING_STRATEGY_CONSTANT, missing_constant="Unknown City")
+    constant_result = remediate_table(dataframe.copy(), [finding], [], config=constant_config)
+    assert "Unknown City" in constant_result.cleaned_dataframe["City"].tolist()
+    assert len(constant_result.cleaned_dataframe) == 3
+
+
+# ---- End-to-end: messy car-price dataset (this feature's own success criteria) --
+
+def test_end_to_end_messy_car_price_dataset():
+    """
+    A reduced version of the messy car-price dataset this feature was
+    built for. Exercises every success criterion in one place: exact
+    duplicates removed, dirty numeric strings coerced to blank,
+    categorical variants standardized, impossible values neutralized,
+    genuinely ambiguous cases left for manual review with a clear
+    reason, a complete audit trail, and the original score computed
+    only from the raw (unmodified) data.
+    """
+    import pandas as pd
+
+    rows = [
+        {"Brand": "BMW", "Fuel_Type": "Diesel", "Year": "2018", "Mileage": "45000", "Price": "500000", "Doors": "4", "Owner_Count": "1"},
+        {"Brand": "BMW", "Fuel_Type": "diesel", "Year": "2016", "Mileage": "62000", "Price": "420000", "Doors": "4", "Owner_Count": "2"},
+        {"Brand": "B.M.W", "Fuel_Type": "Diesal", "Year": "2019", "Mileage": "31000", "Price": "610000", "Doors": "4", "Owner_Count": "1"},
+        {"Brand": "Toyota", "Fuel_Type": "Petrol", "Year": "2020", "Mileage": "18000", "Price": "750000", "Doors": "4", "Owner_Count": "1"},
+        {"Brand": "Toyota", "Fuel_Type": "Petrol", "Year": "2017", "Mileage": "ask", "Price": "680000", "Doors": "5", "Owner_Count": "1"},
+        {"Brand": "Honda", "Fuel_Type": "Petrol", "Year": "2050", "Mileage": "22000", "Price": "N/A", "Doors": "4", "Owner_Count": "1"},
+        {"Brand": "Honda", "Fuel_Type": "Petrol", "Year": "2015", "Mileage": "-500", "Price": "390000", "Doors": "9", "Owner_Count": "1"},
+        # exact duplicate of row index 3 (Toyota Petrol 2020 18000 750000 4 1)
+        {"Brand": "Toyota", "Fuel_Type": "Petrol", "Year": "2020", "Mileage": "18000", "Price": "750000", "Doors": "4", "Owner_Count": "1"},
+    ]
+    dataframe = pd.DataFrame(rows)
+
+    column_types = {
+        "Brand": "text", "Fuel_Type": "text", "Year": "numeric", "Mileage": "numeric",
+        "Price": "numeric", "Doors": "numeric", "Owner_Count": "numeric",
+    }
+    from core.completeness import check_completeness as _cc
+    from core.consistency import check_consistency as _co
+    from core.duplication import check_duplication as _du
+    from core.structure import check_structure as _st
+
+    completeness_result = _cc(dataframe)
+    consistency_result = _co(dataframe, column_types)
+    duplication_result = _du(dataframe, column_types)
+    structure_result = _st(dataframe)
+    validity_result = check_validity(dataframe, column_types)
+
+    from core.scoring import build_scorecard as _build_scorecard
+    from core.fixlist import generate_fix_list as _generate_fix_list
+
+    scorecard = _build_scorecard(completeness_result, consistency_result, duplication_result, structure_result, validity_result)
+    findings, _crit, _mod = _generate_fix_list(
+        completeness_result, consistency_result, duplication_result, structure_result,
+        len(dataframe), table_name="car_price", use_ai_phrasing=False, validity_result=validity_result,
+    )
+    original_score = scorecard.overall_score
+
+    remediation = remediate_table(dataframe, findings, duplication_result.exact_duplicate_row_indexes, config=STANDARD)
+
+    # The score computed above must never change because remediation ran.
+    assert scorecard.overall_score == original_score
+    assert dataframe.equals(pd.DataFrame(rows))  # original dataframe untouched
+
+    # Exact duplicate removed.
+    assert len(remediation.cleaned_dataframe) == len(rows) - 1
+
+    # Dirty numeric strings coerced to blank, never guessed at.
+    mileage_actions = [a for a in remediation.actions if a.column_name == "Mileage" and a.action_type == "coerce_invalid_numeric"]
+    assert len(mileage_actions) == 1
+
+    # Categorical standardization: BMW / Diesel variants converge.
+    brand_actions = [a for a in remediation.actions if a.column_name == "Brand"]
+    fuel_actions = [a for a in remediation.actions if a.column_name == "Fuel_Type" and a.action_type == "standardize_categorical_spelling"]
+    assert brand_actions or fuel_actions  # at least one categorical column got standardized at Standard intensity
+
+    # Impossible values (2050 year, negative mileage, 9 doors) flagged/neutralized.
+    outlier_actions = [a for a in remediation.actions if a.action_type in ("neutralize_domain_outlier", "clip_domain_outlier")]
+    assert outlier_actions
+
+    # "N/A" price normalized to blank.
+    price_actions = [a for a in remediation.actions if a.column_name == "Price" and a.action_type == "normalize_missing_token"]
+    assert len(price_actions) == 1
+
+    # Nothing silently dropped: every Finding is in exactly one place.
+    acted_on_findings = {id(action.source_finding) for action in remediation.actions}
+    reviewed_findings = {id(item.finding) for item in remediation.manual_review}
+    for finding in findings:
+        assert id(finding) in acted_on_findings or id(finding) in reviewed_findings
+    for item in remediation.manual_review:
+        assert item.reason  # every manual-review reason is non-empty, plain language
+
+
 if __name__ == "__main__":
     # Allow running as a plain script too: python tests/test_pipeline.py
     import traceback
@@ -1039,6 +1413,22 @@ if __name__ == "__main__":
         test_remediation_matches_known_test_dataset_issues,
         test_downloaded_cleaned_csv_reloads_cleanly,
         test_chart_generation_makes_one_chart_per_column_with_matching_annotations,
+        test_validity_flags_invalid_type_in_numeric_and_ignores_valid_values,
+        test_validity_flags_invalid_type_in_date,
+        test_validity_flags_categorical_typos_against_dominant_spelling,
+        test_validity_declines_categorical_check_on_high_cardinality_free_text,
+        test_validity_flags_domain_outlier_for_named_rule_doors,
+        test_validity_flags_negative_mileage_and_impossible_year,
+        test_validity_flags_missing_value_representation_tokens,
+        test_completeness_treats_disguised_missing_tokens_as_missing,
+        test_scoring_backward_compatible_without_validity_result,
+        test_remediation_coerces_invalid_numeric_to_blank_never_guesses,
+        test_remediation_coerces_invalid_date_to_blank,
+        test_remediation_normalizes_missing_token_to_blank_unconditionally,
+        test_remediation_categorical_standardization_respects_confidence_threshold,
+        test_remediation_domain_outlier_default_blanks_clip_mode_clips,
+        test_remediation_missing_data_strategy_drop_row_and_constant,
+        test_end_to_end_messy_car_price_dataset,
     ]
     failures = 0
     for test_function in test_functions:

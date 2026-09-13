@@ -37,12 +37,13 @@ for the full fallback story.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from core.completeness import CompletenessResult
 from core.consistency import ConsistencyResult
 from core.duplication import DuplicationResult
 from core.structure import StructureResult
+from core.validity import ValidityResult
 from core.calibration import calibrate_severity_thresholds, ThresholdCalibration
 from core.findings import (
     Finding,
@@ -53,6 +54,7 @@ from core.findings import (
     CHECK_TYPE_CONSISTENCY,
     CHECK_TYPE_DUPLICATION,
     CHECK_TYPE_STRUCTURE,
+    CHECK_TYPE_VALIDITY,
 )
 from templates.fix_templates import FIX_TEMPLATES
 
@@ -79,6 +81,11 @@ _ISSUE_TYPE_TO_CHECK_TYPE = {
     "exact_duplicate_rows": CHECK_TYPE_DUPLICATION,
     "fuzzy_duplicate_rows": CHECK_TYPE_DUPLICATION,
     "structural_issue": CHECK_TYPE_STRUCTURE,
+    "invalid_type_in_numeric": CHECK_TYPE_VALIDITY,
+    "invalid_type_in_date": CHECK_TYPE_VALIDITY,
+    "categorical_inconsistency": CHECK_TYPE_VALIDITY,
+    "domain_outlier": CHECK_TYPE_VALIDITY,
+    "missing_value_representation": CHECK_TYPE_VALIDITY,
 }
 
 
@@ -94,6 +101,11 @@ class _RawIssueCandidate:
     column_name: str
     percentage_affected: float
     format_kwargs: dict  # keyword args for str.format() on the template
+    # Carried straight through to the finished Finding's own .details --
+    # see core/findings.py and core/validity.py's docstrings for what
+    # this is for. None for every candidate type that doesn't need it
+    # (every non-validity candidate, plus most validity ones).
+    details: Optional[dict] = None
 
 
 # ---- Step 1: collect raw candidates (no severity decided yet) ------------
@@ -173,6 +185,35 @@ def _collect_duplication_candidates(duplication_result: DuplicationResult, total
     return candidates
 
 
+def _collect_validity_candidates(validity_result: Optional[ValidityResult]) -> List[_RawIssueCandidate]:
+    """
+    core/validity.py already does its own "collect candidates" pass
+    (ValidityFindingCandidate, built alongside its per-column scores --
+    see that module's check_validity), so this is a thin adapter, not a
+    second detection pass: it just re-shapes each ValidityFindingCandidate
+    into this module's own _RawIssueCandidate so it flows through the
+    same calibrate-then-classify-then-template pipeline as every other
+    dimension's candidates. validity_result is None whenever a caller
+    doesn't compute validity at all (see generate_fix_list's docstring)
+    -- an empty list in that case, not an error.
+    """
+    if validity_result is None:
+        return []
+    candidates = []
+    for item in validity_result.candidates:
+        format_kwargs = {"field": item.column_name, "percentage": item.percentage_affected}
+        if item.example is not None:
+            format_kwargs["example"] = item.example
+        candidates.append(_RawIssueCandidate(
+            issue_type=item.issue_type,
+            column_name=item.column_name,
+            percentage_affected=item.percentage_affected,
+            format_kwargs=format_kwargs,
+            details=item.details,
+        ))
+    return candidates
+
+
 def _collect_structure_candidates(structure_result: StructureResult) -> List[_RawIssueCandidate]:
     candidates = []
     for issue in structure_result.issues:
@@ -235,6 +276,7 @@ def generate_fix_list(
     total_rows: int,
     table_name: str = "table",
     use_ai_phrasing: bool = True,
+    validity_result: Optional[ValidityResult] = None,
 ) -> Tuple[List[Finding], ThresholdCalibration, ThresholdCalibration]:
     """
     Build the full, severity-sorted list of Findings for one table. This
@@ -252,12 +294,21 @@ def generate_fix_list(
     rephrasing pass entirely -- used by tests that want to verify the
     guaranteed template-only path without depending on whether a model
     happens to be downloaded on the machine running the test.
+
+    validity_result: OPTIONAL core/validity.py output (the 5th,
+    Validity, dimension). Defaults to None -- meaning no validity
+    Findings are added and every pre-existing caller of this function
+    gets byte-identical behavior to before this dimension existed. This
+    is what keeps generate_fix_list backward-compatible: core/pipeline.py
+    passes a real ValidityResult now, but nothing about this function's
+    contract required that.
     """
     raw_candidates: List[_RawIssueCandidate] = []
     raw_candidates += _collect_missing_data_candidates(completeness_result)
     raw_candidates += _collect_consistency_candidates(consistency_result)
     raw_candidates += _collect_duplication_candidates(duplication_result, total_rows)
     raw_candidates += _collect_structure_candidates(structure_result)
+    raw_candidates += _collect_validity_candidates(validity_result)
 
     all_percentages = [candidate.percentage_affected for candidate in raw_candidates]
     critical_cutoff, moderate_cutoff = calibrate_severity_thresholds(all_percentages)
@@ -284,6 +335,7 @@ def generate_fix_list(
             # missing-data candidates don't) -- .get() naturally gives
             # None for those, which Finding.example already defaults to.
             example=candidate.format_kwargs.get("example"),
+            details=candidate.details,
         ))
 
     # Sort by severity tier first (critical -> moderate -> minor), then
